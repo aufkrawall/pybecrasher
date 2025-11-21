@@ -2,6 +2,8 @@
 Vibe-scripted Python-based CPU stress test mimicking UE5 workloads
 <img width="867" height="464" alt="pybecrasher" src="https://github.com/user-attachments/assets/c91250ce-a98b-4388-a02c-98e5ecb9dd8a" />
 
+Provided as-is, I DO NOT ACCEPT ANY LIABILITY for issues and damages caused by this tool. 
+
 AI-generated description:
 ## ⚙️ Script Functionality and Process
 
