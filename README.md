@@ -50,3 +50,6 @@ The primary function of this script is to execute a rigorous, controlled hardwar
 
 1.  Place the included `run.bat` and `ue5_stress.py` files in a local folder.
 2.  Open `run.bat`, no admin privileges required.
+
+
+It might actually be really useful, or total garbage. I do not provide updates, nor fix bugs, except when I do.
