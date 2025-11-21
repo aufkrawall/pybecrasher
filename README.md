@@ -40,10 +40,11 @@ The primary function of this script is to execute a rigorous, controlled hardwar
 ### Prerequisites
 * Windows 10/11 (64-bit).
 * Windows page file must be present to avoid oom crashes, pybecrasher causes high virtual memory allocation. Maybe even increase minimum page file size.
+* Make sure your cooling and power supply is sufficient for heavy stresstesting.
 * Python 3.6+ installed and available in the system PATH (normal installation, straightforward procedure).
-* My Zen 3 CPU just instatly reboots the entire system when I test it with a little bit too low voltage, so I could not test the crash detection features well.
+* My Zen 3 CPU just instantly reboots the entire system when I test it with too low voltage, crash detection feature might work or not.
 
 ### Running the Test
 
 1.  Place the included `run.bat` and `ue5_stress.py` files in a local folder.
-2.  Open `run.bat`.
+2.  Open `run.bat`, no admin privileges required.
