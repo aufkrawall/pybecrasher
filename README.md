@@ -45,7 +45,7 @@ The primary function of this script is to execute a rigorous, controlled hardwar
 * Make sure your cooling and power supply are sufficient for heavy stresstesting.
 * Python 3.6+ installed and available in the system PATH (normal installation, straightforward procedure).
 * My Zen 3 CPU just instantly reboots the entire system when I test it with too low voltage, so I couldn't test error detection feature too extensively.
-* Try 2 hours of stress testing. The variable mode probably is more meaningful than steady load mode.
+* Try 2 hours of stress testing. The variable load mode probably is more meaningful than steady load mode. Though steady load mode might be a neat benchmark for shader compile performance.
 
 ### Running the Test
 
