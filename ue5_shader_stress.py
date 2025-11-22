@@ -13,6 +13,7 @@ import threading
 import ctypes
 import zlib
 import multiprocessing
+import collections
 from ctypes import wintypes
 
 # --- Configuration ---
@@ -53,8 +54,6 @@ class Colors:
     BOLD = "\033[1m"
 
 # --- SYSTEM TUNING ---
-# Force Windows Timer Resolution to 1ms (Default is 15.6ms)
-# This prevents utilization dips caused by sleeping too long.
 try:
     ctypes.windll.winmm.timeBeginPeriod(1)
 except:
@@ -80,21 +79,16 @@ def get_total_ram():
     return stat.ullTotalPhys
 
 # --- SHADERS: HYBRID THERMONUCLEAR ---
-# Designed to saturate both Integer and Float pipelines simultaneously
-# to maximize transistor switching (Current Draw) at fixed frequency.
-
 SHADER_TEMPLATE_HYBRID = """
 #define MAX_STEPS {steps}
 struct PS_INPUT {{ float4 Pos : SV_POSITION; float2 UV : TEXCOORD; }};
 float4 PSMain(PS_INPUT input) : SV_TARGET {{
-    // Float Registers (FPU/AVX Units)
     float4 f0 = float4(input.UV, 1.0, 0.5);
     float4 f1 = float4(input.UV.yx, 0.5, 1.0);
     float4 f2 = float4(0.1, 0.2, 0.3, 0.4);
     float4 f3 = float4(0.9, 0.8, 0.7, 0.6);
     float4 c1 = float4(0.123, 0.456, 0.789, 1.234);
 
-    // Integer Registers (ALU Units)
     uint4 i0 = uint4(1, 2, 3, 4);
     uint4 i1 = uint4(5, 6, 7, 8);
     uint4 i2 = uint4(9, 10, 11, 12);
@@ -102,21 +96,17 @@ float4 PSMain(PS_INPUT input) : SV_TARGET {{
 
     [unroll({unroll_factor})]
     for (int i = 0; i < MAX_STEPS; i++) {{
-        // 1. FMA Throughput
         f0 = mad(f1, c1, f2);
         f1 = mad(f2, c1, f3);
         f2 = mad(f3, c1, f0);
         f3 = mad(f0, c1, f1);
 
-        // 2. Integer Bitwise Ops (Parallel execution)
         i0 = (i0 << 1) ^ i1;
         i1 = (i1 >> 1) ^ i2;
         i2 = (i2 << 3) ^ i0 ^ magic;
 
-        // 3. Cross-Domain stress
         if ((i & 127) == 0) {{
             f0 = sin(f0) * cos(f1);
-            // Force Int->Float conversion hardware usage
             f3 += (float4)i0 * 0.00001;
         }}
     }}
@@ -188,12 +178,9 @@ def generate_shader(filename, seed):
     roll = random.random()
     if roll < 0.30:
         data = build_ram_data()
-        # Steps tuned to take ~1.5s
         steps = random.randint(60000, 100000)
         code = SHADER_TEMPLATE_RAM.format(array_size=RAM_ARRAY_SIZE, array_data=data, steps=steps)
     else:
-        # Hybrid Thermonuclear
-        # Steps tuned to take ~2.0s (reduced process overhead)
         steps = random.randint(600000, 1000000)
         unroll = 1024
         code = SHADER_TEMPLATE_HYBRID.format(steps=steps, unroll_factor=unroll)
@@ -212,10 +199,7 @@ def prepare_workload(count):
 
 def compile_once(dxc_path, shader_file):
     try:
-        # ABOVE_NORMAL_PRIORITY_CLASS (0x00008000) + CREATE_NO_WINDOW (0x08000000)
-        # This tells Windows: "This is important, prioritize it over Chrome/Background tasks"
         flags = 0x00008000 | 0x08000000 if sys.platform == 'win32' else 0
-
         cmd = [dxc_path, "-T", "ps_6_6", "-O3", "-Vd", "-E", "PSMain", "-HV", "2021", "-all_resources_bound", shader_file, "-Fo", "NUL"]
         result = subprocess.run(
             cmd,
@@ -288,9 +272,7 @@ class IoStress:
             if (time.time() % 60) < 30: time.sleep(1.0); continue
             k32.SetFilePointer(h, rng.randint(0, max_s)*4096, None, 0)
             k32.ReadFile(h, ctypes.c_void_p(addr), 4096, ctypes.byref(read), None)
-            # Busy spin for IO to keep it "Real Time"
-            # time.sleep(0.0001)
-
+            time.sleep(0.0001)
         k32.CloseHandle(h)
 
 def noise_entry(stop, q, d):
@@ -326,7 +308,6 @@ def worker_loop(dxc, pool, mode, stop):
             time.sleep(PULSE_DURATION)
             next_pulse = time.time() + PULSE_INTERVAL + random.uniform(-1, 1)
 
-        # LOAD BALANCING with BUSY WAIT
         wait = False
         if mode == "variable":
             with stats_lock:
@@ -337,8 +318,6 @@ def worker_loop(dxc, pool, mode, stop):
 
         if crashed: break
         if wait:
-            # BUSY WAIT: Burn cycles instead of sleeping to keep core hot
-            # This prevents the 15ms OS Scheduler gap.
             for _ in range(1000): pass
             continue
 
@@ -399,6 +378,10 @@ def real_main():
         workers.append(t); t.start()
 
     start = time.time()
+    rate_history = collections.deque()
+    last_rate_update = 0.0
+    display_rate = 0.0
+
     try:
         while not stop.is_set():
             now = time.time(); elapsed = now - start
@@ -416,13 +399,34 @@ def real_main():
 
             with stats_lock: ac, cc, ec = active_compiles, compiled_count, error_count
 
+            # Rolling Average (Internal Calculation)
+            calculated_rate = 0.0
+            if args.mode == "steady":
+                rate_history.append((now, cc))
+                # 30 Seconds Rolling Average
+                while rate_history and rate_history[0][0] < now - 30.0:
+                    rate_history.popleft()
+
+                if len(rate_history) > 1:
+                    d_t = rate_history[-1][0] - rate_history[0][0]
+                    d_c = rate_history[-1][1] - rate_history[0][1]
+                    calculated_rate = d_c / d_t if d_t > 0 else 0.0
+            else:
+                calculated_rate = cc / elapsed if elapsed > 0 else 0.0
+
+            # Display Latch (2.0s for Steady, 0.5s for Variable)
+            update_interval = 2.0 if args.mode == "steady" else 0.5
+            if now - last_rate_update > update_interval:
+                display_rate = calculated_rate
+                last_rate_update = now
+
             io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}" if (elapsed%60)>=30 else " [IO: OFF]"
             int_s = f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}"
             color = Colors.OKGREEN if "IDLE" in phase else (Colors.FAIL if "SPIKE" in phase else Colors.WARNING)
 
             try: cols = shutil.get_terminal_size().columns
             except: cols = 120
-            stat = f"Time: {str(datetime.timedelta(seconds=int(elapsed)))} | Rate: {cc/elapsed if elapsed>0 else 0:.1f}/s | Act: {ac} | Err: {ec} | {color}{phase}{Colors.ENDC}{io_s}{int_s}"
+            stat = f"Time: {str(datetime.timedelta(seconds=int(elapsed)))} | Rate: {display_rate:.1f}/s | Act: {ac} | Err: {ec} | {color}{phase}{Colors.ENDC}{io_s}{int_s}"
             print(f"\r{stat:<{cols-1}}", end="", flush=True)
 
             if crashed:
@@ -445,8 +449,6 @@ def run_watchdog():
     script = os.path.abspath(sys.argv[0])
     print(f"{Colors.HEADER}=== UE5 Stress Watchdog Active ==={Colors.ENDC}")
     try:
-        # Launch with CREATE_NEW_CONSOLE is cleaner but we want to see output.
-        # Just rely on default.
         proc = subprocess.Popen([sys.executable, script, "--worker"] + sys.argv[1:])
         while proc.poll() is None: time.sleep(0.5)
         if proc.returncode != 0 and proc.returncode != 3221225786:
