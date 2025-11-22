@@ -384,7 +384,6 @@ def worker_loop(dxc, pool, mode, stop):
 
 def get_target(elapsed, total, mode):
     if mode in ["steady", "benchmark"]: return total, "STEADY MAX", True
-
     t = elapsed % CYCLE_DURATION
     if t < 20: return total, "HEAT SOAK", True
     if t < 35: return (0 if int(t)%2==0 else total), "SPIKE WAVE", True
@@ -396,10 +395,8 @@ def get_target(elapsed, total, mode):
             (total, "CHAOS 100%")
         ])
         return choice[0], choice[1], True
-
-    random.seed(int(t*5))
-    tgt = 1 if int(t)%2==0 else 2
-    return tgt, f"BOOST ({tgt}T)", False
+    tgt = [0,1,2,4][int(t*4)%4]
+    return min(tgt, total), f"STROBE ({tgt})", False
 
 def real_main(input_args=None):
     p = argparse.ArgumentParser()
@@ -410,13 +407,13 @@ def real_main(input_args=None):
     if input_args: args = p.parse_args(input_args)
     else: args = p.parse_args()
 
-    # --- THREAD LOGIC ---
+    # --- ADJUST THREAD COUNT ---
     actual_threads = args.threads
     if actual_threads == -1:
         if args.mode == "benchmark":
             actual_threads = LOGICAL_CORES
         else:
-            # Steady AND Variable: Reserve 4 cores for Noise
+            # Steady & Variable: Reserve 4 cores for Noise
             actual_threads = max(1, LOGICAL_CORES - 4)
 
     global target_active, pulse_barrier
@@ -477,20 +474,10 @@ def real_main(input_args=None):
 
             tgt, phase, noise_state = get_target(elapsed, actual_threads, args.mode)
 
-            if args.mode != "benchmark" and noise:
-                if noise_state:
-                    # Logic: Noise is ON (Active or Idle, doesn't matter for process level, threads handle it)
-                    # Wait, the Noise threads are infinite loops.
-                    # For Boost Phase (noise_state=False), we need to pause them.
-                    # But we can't easily pause a whole process from here without an event.
-                    # CRITICAL FIX: I added noise_event to the classes but forgot to pass it in noise_entry!
-                    # Since I can't pass it to noise_entry easily without breaking signature...
-                    # ACTUALLY: I removed the event from noise_entry args in this version to simplify.
-                    # Let's just rely on the fact that in variable mode, the noise is constant except for Boost.
-                    # If we want to silence noise, we terminate/suspend.
-                    pass
-                else:
-                   pass
+            # Apply Noise State logic if you have it hooked up
+            # Currently noise runs always in Steady/Variable unless we use event
+            # The noise_entry function doesn't check event in this version
+            # but variable mode logic is applied via target_active
 
             if args.mode == "variable":
                 with stats_lock: target_active = tgt
@@ -512,6 +499,7 @@ def real_main(input_args=None):
                 if not rate_history or (now - rate_history[-1][0]) > 0.25:
                     rate_history.append((now, cc))
                     while rate_history and rate_history[0][0] < now - 30.0: rate_history.popleft()
+
                     rate_history_60.append((now, cc))
                     while rate_history_60 and rate_history_60[0][0] < now - 60.0: rate_history_60.popleft()
 
@@ -546,6 +534,7 @@ def real_main(input_args=None):
             io_s = ""
             int_s = ""
             if args.mode != "benchmark":
+                # IO and Integrity are always active in the noise process for Steady/Variable
                 io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}"
                 int_s = f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}"
 
@@ -622,7 +611,11 @@ def run_watchdog():
             print(f"{Colors.OKBLUE}[5]{Colors.ENDC} View LICENSE")
             print("")
 
-            choice = input("Enter selection (default is 1): ").strip()
+            try:
+                choice = input("Enter selection (default is 1): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nExiting...")
+                return
 
             if choice == "4":
                 print_file_content("README.md", "README")
