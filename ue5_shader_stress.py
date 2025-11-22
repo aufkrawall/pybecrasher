@@ -1,3 +1,25 @@
+# MIT License
+#
+# Copyright (c) 2024 aufkrawall
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 import os
 import sys
 import subprocess
@@ -14,6 +36,7 @@ import ctypes
 import zlib
 import multiprocessing
 import collections
+import signal
 from ctypes import wintypes
 
 # --- Configuration ---
@@ -276,6 +299,8 @@ class IoStress:
         k32.CloseHandle(h)
 
 def noise_entry(stop, q, d):
+    # FIX: Removed signal.SIG_IGN.
+    # We rely on the try/except KeyboardInterrupt to catch the signal and exit cleanly.
     try:
         ts = []
         ts.append(threading.Thread(target=RamAnvil(stop).start_loop, daemon=True))
@@ -284,7 +309,8 @@ def noise_entry(stop, q, d):
         ts.append(threading.Thread(target=IoStress(stop, d).start_loop, daemon=True))
         for t in ts: t.start()
         while not stop.is_set(): time.sleep(0.5)
-    except KeyboardInterrupt: pass
+    except KeyboardInterrupt:
+        pass # Exit gracefully when Ctrl+C is pressed
 
 # --- MAIN PROCESS ---
 stats_lock = threading.Lock()
@@ -358,7 +384,7 @@ def real_main():
     if args.mode == "variable": pulse_barrier = threading.Barrier(args.threads)
 
     dxc = get_dxc_path(args.dxc)
-    print(f"{Colors.HEADER}=== UE5 Stress: UNLEASHED EDITION ==={Colors.ENDC}")
+    print(f"{Colors.HEADER}=== UE5 Stress: FINAL EDITION ==={Colors.ENDC}")
     print(f"Threads: {args.threads} | Mode: {args.mode} | Priority: ABOVE_NORMAL")
 
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
@@ -368,6 +394,7 @@ def real_main():
     mp_stop = multiprocessing.Event()
     mp_q = multiprocessing.Queue()
     noise = multiprocessing.Process(target=noise_entry, args=(mp_stop, mp_q, TEMP_DIR))
+    noise.daemon = True
     noise.start()
 
     stop = threading.Event()
@@ -378,9 +405,18 @@ def real_main():
         workers.append(t); t.start()
 
     start = time.time()
-    rate_history = collections.deque()
+
+    # Rate Calculation State
+    rate_history = collections.deque() # 30s
+    rate_history_60 = collections.deque() # 60s
+
     last_rate_update = 0.0
+    last_60s_update = 0.0
     display_rate = 0.0
+    display_60s = "N/A"
+
+    last_var_cc = 0
+    last_var_time = start
 
     try:
         while not stop.is_set():
@@ -399,41 +435,61 @@ def real_main():
 
             with stats_lock: ac, cc, ec = active_compiles, compiled_count, error_count
 
-            # Rolling Average (Internal Calculation)
             calculated_rate = 0.0
+
             if args.mode == "steady":
-                rate_history.append((now, cc))
-                # 30 Seconds Rolling Average
-                while rate_history and rate_history[0][0] < now - 30.0:
-                    rate_history.popleft()
+                if not rate_history or (now - rate_history[-1][0]) > 0.25:
+                    rate_history.append((now, cc))
+                    while rate_history and rate_history[0][0] < now - 30.0: rate_history.popleft()
+
+                    rate_history_60.append((now, cc))
+                    while rate_history_60 and rate_history_60[0][0] < now - 60.0: rate_history_60.popleft()
 
                 if len(rate_history) > 1:
                     d_t = rate_history[-1][0] - rate_history[0][0]
                     d_c = rate_history[-1][1] - rate_history[0][1]
                     calculated_rate = d_c / d_t if d_t > 0 else 0.0
-            else:
-                calculated_rate = cc / elapsed if elapsed > 0 else 0.0
 
-            # Display Latch (2.0s for Steady, 0.5s for Variable)
-            update_interval = 2.0 if args.mode == "steady" else 0.5
+                if elapsed > 60.0 and (now - last_60s_update) > 60.0:
+                    if len(rate_history_60) > 1:
+                        d60_t = rate_history_60[-1][0] - rate_history_60[0][0]
+                        d60_c = rate_history_60[-1][1] - rate_history_60[0][1]
+                        val = d60_c / d60_t if d60_t > 0 else 0.0
+                        display_60s = f"{val:.1f}/s"
+                    last_60s_update = now
+
+                update_interval = 2.0
+            else:
+                update_interval = 0.5
+
             if now - last_rate_update > update_interval:
-                display_rate = calculated_rate
+                if args.mode == "variable":
+                    dt = now - last_var_time
+                    dc = cc - last_var_cc
+                    display_rate = dc / dt if dt > 0 else 0.0
+                    last_var_time = now
+                    last_var_cc = cc
+                else:
+                    display_rate = calculated_rate
+
                 last_rate_update = now
 
             io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}" if (elapsed%60)>=30 else " [IO: OFF]"
             int_s = f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}"
             color = Colors.OKGREEN if "IDLE" in phase else (Colors.FAIL if "SPIKE" in phase else Colors.WARNING)
 
+            avg_60_str = f" | 60s Avg: {display_60s}" if args.mode == "steady" else ""
+
             try: cols = shutil.get_terminal_size().columns
             except: cols = 120
-            stat = f"Time: {str(datetime.timedelta(seconds=int(elapsed)))} | Rate: {display_rate:.1f}/s | Act: {ac} | Err: {ec} | {color}{phase}{Colors.ENDC}{io_s}{int_s}"
+            stat = f"Time: {str(datetime.timedelta(seconds=int(elapsed)))} | Rate: {display_rate:.1f}/s{avg_60_str} | Act: {ac} | Err: {ec} | {color}{phase}{Colors.ENDC}{io_s}{int_s}"
             print(f"\r{stat:<{cols-1}}", end="", flush=True)
 
             if crashed:
                 print(f"\n\n{Colors.FAIL}{'='*60}\nFAILURE DETECTED\n{'='*60}{Colors.ENDC}")
                 if crash_info: print(f"Code: {crash_info[0]}\nMsg: {crash_info[2]}")
                 sys.exit(1)
-            time.sleep(0.1)
+            time.sleep(0.05)
     except KeyboardInterrupt: pass
     finally:
         stop.set(); mp_stop.set()
