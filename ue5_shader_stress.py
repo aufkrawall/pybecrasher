@@ -97,7 +97,10 @@ def print_file_content(filename, title):
     except Exception as e:
         print(f"Error reading file: {e}")
     print(f"\n{Colors.OKBLUE}========================================{Colors.ENDC}")
-    input("\nPress Enter to return to menu...")
+    try:
+        input("\nPress Enter to return to menu...")
+    except KeyboardInterrupt:
+        pass # Return to menu logic handles this
 
 # --- SYSTEM TUNING ---
 try:
@@ -263,7 +266,9 @@ def compile_once(dxc_path, shader_file):
 
 # --- NOISE PROCESS ---
 class RamAnvil:
-    def __init__(self, stop_event): self.stop_event = stop_event
+    def __init__(self, stop_event, noise_event):
+        self.stop_event = stop_event
+        self.noise_event = noise_event
     def start_loop(self):
         try:
             total = get_total_ram()
@@ -273,35 +278,43 @@ class RamAnvil:
         except: return
         rng = random.Random(); view = memoryview(buf); max_idx = size - 1024*1024
         while not self.stop_event.is_set():
+            if not self.noise_event.is_set(): time.sleep(0.1); continue
             try:
                 idx = rng.randint(0, max_idx); _ = view[idx]; view[idx] = rng.randint(0, 255)
             except: break
 
 class CacheTrasher:
-    def __init__(self, stop_event):
+    def __init__(self, stop_event, noise_event):
         self.stop_event = stop_event
+        self.noise_event = noise_event
         self.raw = ctypes.create_string_buffer(128)
         self.align = (ctypes.addressof(self.raw) + 63) & ~63
     def _thrasher(self):
-        while not self.stop_event.is_set(): ctypes.memset(self.align, 1, 1)
+        while not self.stop_event.is_set():
+            if not self.noise_event.is_set(): time.sleep(0.1); continue
+            ctypes.memset(self.align, 1, 1)
     def start_loop(self):
         t = threading.Thread(target=self._thrasher, daemon=True)
         t.start(); t.join()
 
 class IntegrityStress:
-    def __init__(self, stop_event, q): self.stop_event = stop_event; self.q = q
+    def __init__(self, stop_event, q, noise_event):
+        self.stop_event = stop_event
+        self.q = q
+        self.noise_event = noise_event
     def start_loop(self):
         raw = os.urandom(1024) * 16384; exp = zlib.crc32(raw); comp = zlib.compress(raw, level=6)
         while not self.stop_event.is_set():
+            if not self.noise_event.is_set(): time.sleep(0.1); continue
             try:
                 if zlib.crc32(zlib.decompress(comp)) != exp:
                     self.q.put((0xC0000428, "INTEGRITY FAILURE", "Checksum")); self.stop_event.set(); break
-                time.sleep(0.01)
             except: pass
 
 class IoStress:
-    def __init__(self, stop_event, d, s=1024):
+    def __init__(self, stop_event, d, noise_event, s=1024):
         self.stop_event = stop_event; self.f = os.path.join(d, "io.dat"); self.s = s * 1024 * 1024
+        self.noise_event = noise_event
     def start_loop(self):
         if not os.path.exists(self.f):
             with open(self.f, 'wb') as f: f.write(os.urandom(self.s))
@@ -315,24 +328,20 @@ class IoStress:
         buf = ctypes.create_string_buffer(8192); addr = (ctypes.addressof(buf) + 4095) & ~4095
         read = wintypes.DWORD(); rng = random.Random(); max_s = (self.s - 4096) // 4096
         while not self.stop_event.is_set():
+            if not self.noise_event.is_set(): time.sleep(0.1); continue
             k32.SetFilePointer(h, rng.randint(0, max_s)*4096, None, 0)
             k32.ReadFile(h, ctypes.c_void_p(addr), 4096, ctypes.byref(read), None)
-            time.sleep(0.0001)
         k32.CloseHandle(h)
 
-def noise_entry(stop, q, d):
-    try:
-        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080) # HIGH
-    except: pass
-
+def noise_entry(stop, q, d, noise_event):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         ts = []
-        ts.append(threading.Thread(target=RamAnvil(stop).start_loop, daemon=True))
-        ts.append(threading.Thread(target=CacheTrasher(stop).start_loop, daemon=True))
-        ts.append(threading.Thread(target=IntegrityStress(stop, q).start_loop, daemon=True))
-        ts.append(threading.Thread(target=IntegrityStress(stop, q).start_loop, daemon=True))
-        ts.append(threading.Thread(target=IoStress(stop, d).start_loop, daemon=True))
+        ts.append(threading.Thread(target=RamAnvil(stop, noise_event).start_loop, daemon=True))
+        ts.append(threading.Thread(target=CacheTrasher(stop, noise_event).start_loop, daemon=True))
+        ts.append(threading.Thread(target=IntegrityStress(stop, q, noise_event).start_loop, daemon=True))
+        ts.append(threading.Thread(target=IntegrityStress(stop, q, noise_event).start_loop, daemon=True))
+        ts.append(threading.Thread(target=IoStress(stop, d, noise_event).start_loop, daemon=True))
         for t in ts: t.start()
         while not stop.is_set(): time.sleep(0.5)
     except: pass
@@ -385,8 +394,10 @@ def worker_loop(dxc, pool, mode, stop):
 def get_target(elapsed, total, mode):
     if mode in ["steady", "benchmark"]: return total, "STEADY MAX", True
     t = elapsed % CYCLE_DURATION
+
     if t < 20: return total, "HEAT SOAK", True
     if t < 35: return (0 if int(t)%2==0 else total), "SPIKE WAVE", True
+
     if t < 50:
         random.seed(int(t*10))
         choice = random.choice([
@@ -395,8 +406,11 @@ def get_target(elapsed, total, mode):
             (total, "CHAOS 100%")
         ])
         return choice[0], choice[1], True
-    tgt = [0,1,2,4][int(t*4)%4]
-    return min(tgt, total), f"STROBE ({tgt})", False
+
+    # 50-60s: BOOST PHASE
+    # Return 1 or 2 threads, NO NOISE (False)
+    tgt = 1 if int(t)%2==0 else 2
+    return tgt, f"BOOST ({tgt}T)", False
 
 def real_main(input_args=None):
     p = argparse.ArgumentParser()
@@ -434,7 +448,7 @@ def real_main(input_args=None):
 
     noise = None
     if args.mode != "benchmark":
-        noise = multiprocessing.Process(target=noise_entry, args=(mp_stop, mp_q, TEMP_DIR))
+        noise = multiprocessing.Process(target=noise_entry, args=(mp_stop, mp_q, TEMP_DIR, mp_noise_event))
         noise.daemon = True
         noise.start()
 
@@ -474,10 +488,10 @@ def real_main(input_args=None):
 
             tgt, phase, noise_state = get_target(elapsed, actual_threads, args.mode)
 
-            # Apply Noise State logic if you have it hooked up
-            # Currently noise runs always in Steady/Variable unless we use event
-            # The noise_entry function doesn't check event in this version
-            # but variable mode logic is applied via target_active
+            # Toggle Noise Process via Event
+            if args.mode != "benchmark" and noise:
+                if noise_state: mp_noise_event.set()
+                else: mp_noise_event.clear()
 
             if args.mode == "variable":
                 with stats_lock: target_active = tgt
@@ -499,7 +513,6 @@ def real_main(input_args=None):
                 if not rate_history or (now - rate_history[-1][0]) > 0.25:
                     rate_history.append((now, cc))
                     while rate_history and rate_history[0][0] < now - 30.0: rate_history.popleft()
-
                     rate_history_60.append((now, cc))
                     while rate_history_60 and rate_history_60[0][0] < now - 60.0: rate_history_60.popleft()
 
@@ -534,9 +547,9 @@ def real_main(input_args=None):
             io_s = ""
             int_s = ""
             if args.mode != "benchmark":
-                # IO and Integrity are always active in the noise process for Steady/Variable
-                io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}"
-                int_s = f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}"
+                is_active = mp_noise_event.is_set()
+                io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}" if is_active else " [IO: OFF]"
+                int_s = f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}" if is_active else " [INT: PAUSE]"
 
             extra_info = ""
             if args.mode == "steady":
@@ -582,56 +595,57 @@ def run_watchdog():
 
     if len(sys.argv) == 1:
         interactive_mode = True
-        while True:
-            os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"{Colors.HEADER}========================================================")
-            print("                       PYBECRASHER                      ")
-            print("    UE5 SHADER COMPILATION AND OODLE STRESS SIMULATOR   ")
-            print(f"========================================================{Colors.ENDC}")
-            print("")
-            print("This tool simulates the Unreal Engine 5 \"Preparing Shaders\"")
-            print("workload plus Oodle decompression to test CPU/RAM stability.")
-            print("")
-            print("Select Mode:")
-            print("")
-            print(f"{Colors.OKBLUE}[1]{Colors.ENDC} Variable \"Chaos\" Load")
-            print("    - Cycles between Single Core, Ramp Up, Random, and")
-            print("      Transient Spikes (Idle to Max instantly).")
-            print("")
-            print(f"{Colors.OKBLUE}[2]{Colors.ENDC} Steady Load")
-            print("    - Constant 100% load.")
-            print("    - Best for thermal testing.")
-            print("")
-            print(f"{Colors.OKBLUE}[3]{Colors.ENDC} Benchmark Mode")
-            print("    - Pure Compiler Throughput (No Noise).")
-            print("    - Best for comparing CPU performance.")
-            print("")
-            print("--- Info ---")
-            print(f"{Colors.OKBLUE}[4]{Colors.ENDC} View README.md")
-            print(f"{Colors.OKBLUE}[5]{Colors.ENDC} View LICENSE")
-            print("")
+        # Catch KeyboardInterrupt in the menu loop
+        try:
+            while True:
+                os.system('cls' if os.name == 'nt' else 'clear')
+                print(f"{Colors.HEADER}========================================================")
+                print("                       PYBECRASHER                      ")
+                print("    UE5 SHADER COMPILATION AND OODLE STRESS SIMULATOR   ")
+                print(f"========================================================{Colors.ENDC}")
+                print("")
+                print("This tool simulates the Unreal Engine 5 \"Preparing Shaders\"")
+                print("workload plus Oodle decompression to test CPU/RAM stability.")
+                print("")
+                print("Select Mode:")
+                print("")
+                print(f"{Colors.OKBLUE}[1]{Colors.ENDC} Variable \"Chaos\" Load")
+                print("    - Cycles between Single Core, Ramp Up, Random, and")
+                print("      Transient Spikes (Idle to Max instantly).")
+                print("")
+                print(f"{Colors.OKBLUE}[2]{Colors.ENDC} Steady Load")
+                print("    - Constant 100% load.")
+                print("    - Best for thermal testing.")
+                print("")
+                print(f"{Colors.OKBLUE}[3]{Colors.ENDC} Benchmark Mode")
+                print("    - Pure Compiler Throughput (No Noise).")
+                print("    - Best for comparing CPU performance.")
+                print("")
+                print("--- Info ---")
+                print(f"{Colors.OKBLUE}[4]{Colors.ENDC} View README.md")
+                print(f"{Colors.OKBLUE}[5]{Colors.ENDC} View LICENSE")
+                print("")
 
-            try:
                 choice = input("Enter selection (default is 1): ").strip()
-            except (KeyboardInterrupt, EOFError):
-                print("\nExiting...")
-                return
 
-            if choice == "4":
-                print_file_content("README.md", "README")
-                continue
-            elif choice == "5":
-                print_file_content("LICENSE", "LICENSE")
-                continue
-            elif choice == "2":
-                pass_args = ["--mode", "steady"]
-                break
-            elif choice == "3":
-                pass_args = ["--mode", "benchmark"]
-                break
-            else:
-                pass_args = ["--mode", "variable"]
-                break
+                if choice == "4":
+                    print_file_content("README.md", "README")
+                    continue
+                elif choice == "5":
+                    print_file_content("LICENSE", "LICENSE")
+                    continue
+                elif choice == "2":
+                    pass_args = ["--mode", "steady"]
+                    break
+                elif choice == "3":
+                    pass_args = ["--mode", "benchmark"]
+                    break
+                else:
+                    pass_args = ["--mode", "variable"]
+                    break
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting...")
+            return
 
         print("")
         print(f"Starting Stress Test in {pass_args[1]} mode...")
