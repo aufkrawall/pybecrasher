@@ -5,7 +5,7 @@ Vibe-scripted Python-based CPU stress test mimicking UE5 workloads
 > **⚠️ DISCLAIMER:** Provided as-is. I DO NOT ACCEPT ANY LIABILITY for issues, hardware damage, OS corruption, or data loss caused by this tool.
 
 AI-generated and edited description:
-## ⚙️ Script Functionality and Process
+## Script Functionality and Process
 
 The primary function of this script is to execute a rigorous, controlled hardware stress test by simulating the most resource-intensive aspects of a game engine's asset pipeline.
 
