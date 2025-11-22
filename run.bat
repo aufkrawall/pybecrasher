@@ -20,7 +20,6 @@ echo [2] Steady Load
 echo     - Constant 100%% load.
 echo     - Best for thermal testing (and performance comparison).
 echo.
-
 set "choice=1"
 set /p choice="Enter selection (default is 1): "
 
@@ -31,13 +30,14 @@ echo.
 echo Starting Stress Test in %MODE_ARG% mode...
 echo Press Ctrl+C to stop at any time.
 echo.
-
 :: Run the Python script
 python ue5_shader_stress.py %MODE_ARG%
 
-:: Keep window open
+:: If script crashed (ErrorLevel 1), pause so user can see error.
+:: If script exited via Ctrl+C (ErrorLevel 3221225786 or similar), it usually returns non-zero too.
+:: But typically we want to see the result unless user explicitly closed it.
 echo.
 echo ========================================================
-echo Test execution finished (or crashed).
+echo Test execution finished.
 echo ========================================================
 pause
