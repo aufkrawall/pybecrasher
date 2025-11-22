@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2024 aufkrawall
+# Copyright (c) 2024 [Your Name/GitHub Username]
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -75,6 +75,29 @@ class Colors:
     FAIL = "\033[91m"
     ENDC = "\033[0m"
     BOLD = "\033[1m"
+
+# --- RESOURCE HELPER ---
+def get_resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def print_file_content(filename, title):
+    path = get_resource_path(filename)
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(f"{Colors.HEADER}=== {title} ==={Colors.ENDC}\n")
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                print(f.read())
+        else:
+            print(f"{Colors.FAIL}File '{filename}' not found in bundle.{Colors.ENDC}")
+    except Exception as e:
+        print(f"Error reading file: {e}")
+    print(f"\n{Colors.OKBLUE}========================================{Colors.ENDC}")
+    input("\nPress Enter to return to menu...")
 
 # --- SYSTEM TUNING ---
 try:
@@ -299,18 +322,17 @@ class IoStress:
         k32.CloseHandle(h)
 
 def noise_entry(stop, q, d):
-    # FIX: Removed signal.SIG_IGN.
-    # We rely on the try/except KeyboardInterrupt to catch the signal and exit cleanly.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         ts = []
         ts.append(threading.Thread(target=RamAnvil(stop).start_loop, daemon=True))
         ts.append(threading.Thread(target=CacheTrasher(stop).start_loop, daemon=True))
         ts.append(threading.Thread(target=IntegrityStress(stop, q).start_loop, daemon=True))
+        ts.append(threading.Thread(target=IntegrityStress(stop, q).start_loop, daemon=True))
         ts.append(threading.Thread(target=IoStress(stop, d).start_loop, daemon=True))
         for t in ts: t.start()
         while not stop.is_set(): time.sleep(0.5)
-    except KeyboardInterrupt:
-        pass # Exit gracefully when Ctrl+C is pressed
+    except: pass
 
 # --- MAIN PROCESS ---
 stats_lock = threading.Lock()
@@ -373,23 +395,35 @@ def get_target(elapsed, total, mode):
     tgt = [0,1,2,4][int(t*4)%4]
     return min(tgt, total), f"STROBE ({tgt})"
 
-def real_main():
+def real_main(input_args=None):
     p = argparse.ArgumentParser()
     p.add_argument("--dxc"); p.add_argument("--threads", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--mode", default="steady"); p.add_argument("--duration", type=int, default=0)
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    args = p.parse_args()
+
+    if input_args: args = p.parse_args(input_args)
+    else: args = p.parse_args()
+
+    # --- LOGIC: ADJUST THREAD COUNT ---
+    actual_threads = args.threads
+    if actual_threads == -1:
+        if args.mode == "steady":
+            # Balanced saturation: Leaves 3 cores for noise/OS to ensure 99% load
+            actual_threads = max(1, LOGICAL_CORES - 3)
+        else:
+            # Variable mode uses full core count for chaos
+            actual_threads = LOGICAL_CORES
 
     global target_active, pulse_barrier
-    if args.mode == "variable": pulse_barrier = threading.Barrier(args.threads)
+    if args.mode == "variable": pulse_barrier = threading.Barrier(actual_threads)
 
     dxc = get_dxc_path(args.dxc)
     print(f"{Colors.HEADER}=== UE5 Stress: FINAL EDITION ==={Colors.ENDC}")
-    print(f"Threads: {args.threads} | Mode: {args.mode} | Priority: ABOVE_NORMAL")
+    print(f"Threads: {actual_threads} | Mode: {args.mode} | Priority: ABOVE_NORMAL")
 
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
-    pool = prepare_workload(max(200, args.threads * 4))
+    pool = prepare_workload(max(200, actual_threads * 4))
 
     mp_stop = multiprocessing.Event()
     mp_q = multiprocessing.Queue()
@@ -399,16 +433,14 @@ def real_main():
 
     stop = threading.Event()
     workers = []
-    with stats_lock: target_active = args.threads if args.mode == "steady" else 0
-    for _ in range(args.threads):
+    with stats_lock: target_active = actual_threads if args.mode == "steady" else 0
+    for _ in range(actual_threads):
         t = threading.Thread(target=worker_loop, args=(dxc, pool, args.mode, stop), daemon=True)
         workers.append(t); t.start()
 
     start = time.time()
-
-    # Rate Calculation State
-    rate_history = collections.deque() # 30s
-    rate_history_60 = collections.deque() # 60s
+    rate_history = collections.deque()
+    rate_history_60 = collections.deque()
 
     last_rate_update = 0.0
     last_60s_update = 0.0
@@ -428,7 +460,7 @@ def real_main():
                 global crashed, crash_info
                 crashed = True; crash_info = c; stop.set()
 
-            tgt, phase = get_target(elapsed, args.threads, args.mode)
+            tgt, phase = get_target(elapsed, actual_threads, args.mode)
             if args.mode == "variable":
                 with stats_lock: target_active = tgt
             else: phase = "STEADY MAX"
@@ -494,7 +526,12 @@ def real_main():
     finally:
         stop.set(); mp_stop.set()
         for t in workers: t.join(1.0)
-        noise.terminate()
+
+        if noise.is_alive():
+            noise.terminate()
+            noise.join(timeout=2.0)
+            if noise.is_alive(): noise.kill()
+
         try: ctypes.windll.winmm.timeEndPeriod(1)
         except: pass
         print("\nCleanup Done.")
@@ -502,17 +539,94 @@ def real_main():
         except: pass
 
 def run_watchdog():
-    script = os.path.abspath(sys.argv[0])
-    print(f"{Colors.HEADER}=== UE5 Stress Watchdog Active ==={Colors.ENDC}")
+    pass_args = sys.argv[1:]
+    interactive_mode = False
+
+    if len(sys.argv) == 1:
+        interactive_mode = True
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print(f"{Colors.HEADER}========================================================")
+            print("                       PYBECRASHER                      ")
+            print("    UE5 SHADER COMPILATION AND OODLE STRESS SIMULATOR   ")
+            print(f"========================================================{Colors.ENDC}")
+            print("")
+            print("This tool simulates the Unreal Engine 5 \"Preparing Shaders\"")
+            print("workload plus Oodle decompression to test CPU/RAM stability.")
+            print("")
+            print("Select Mode:")
+            print("")
+            print(f"{Colors.OKBLUE}[1]{Colors.ENDC} Variable \"Chaos\" Load")
+            print("    - Cycles between Single Core, Ramp Up, Random, and")
+            print("      Transient Spikes (Idle to Max instantly).")
+            print("")
+            print(f"{Colors.OKBLUE}[2]{Colors.ENDC} Steady Load")
+            print("    - Constant 100% load.")
+            print("    - Best for thermal testing (and performance comparison).")
+            print("")
+            print("--- Info ---")
+            print(f"{Colors.OKBLUE}[3]{Colors.ENDC} View README.md")
+            print(f"{Colors.OKBLUE}[4]{Colors.ENDC} View LICENSE")
+            print("")
+
+            choice = input("Enter selection (default is 1): ").strip()
+
+            if choice == "3":
+                print_file_content("README.md", "README")
+                continue
+            elif choice == "4":
+                print_file_content("LICENSE", "LICENSE")
+                continue
+            elif choice == "2":
+                pass_args = ["--mode", "steady"]
+                break
+            else:
+                pass_args = ["--mode", "variable"]
+                break
+
+        print("")
+        print(f"Starting Stress Test in {pass_args[1]} mode...")
+        print("Press Ctrl+C to stop at any time.")
+        print("")
+
+    if getattr(sys, 'frozen', False):
+        cmd = [sys.executable, "--worker"] + pass_args
+    else:
+        script = os.path.abspath(sys.argv[0])
+        cmd = [sys.executable, script, "--worker"] + pass_args
+
+    aborted = False
     try:
-        proc = subprocess.Popen([sys.executable, script, "--worker"] + sys.argv[1:])
-        while proc.poll() is None: time.sleep(0.5)
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0
+        proc = subprocess.Popen(cmd, creationflags=creationflags)
+
+        while proc.poll() is None:
+            time.sleep(0.5)
+
         if proc.returncode != 0 and proc.returncode != 3221225786:
              print(f"\n{Colors.FAIL}CRITICAL FAILURE: Exit Code {proc.returncode}{Colors.ENDC}")
              if proc.returncode in CRASH_EXIT_CODES: print(f"Reason: {CRASH_EXIT_CODES[proc.returncode]}")
-    except KeyboardInterrupt: proc.terminate()
+    except KeyboardInterrupt:
+        aborted = True
+        if sys.platform == 'win32':
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            proc.terminate()
+
+        print("\nStopping...")
+        try: proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired: proc.kill()
+
+    if interactive_mode and not aborted:
+        print("")
+        print("========================================================")
+        print("Test execution finished.")
+        print("========================================================")
+        input("Press Enter to close...")
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    if "--worker" in sys.argv: real_main()
-    else: run_watchdog()
+    if "--worker" in sys.argv:
+        real_main(sys.argv[1:])
+    else:
+        run_watchdog()
