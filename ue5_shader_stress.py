@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2024 [Your Name/GitHub Username]
+# Copyright (c) 2024 aufkrawall
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -245,7 +245,7 @@ def prepare_workload(count):
 
 def compile_once(dxc_path, shader_file):
     try:
-        flags = 0x00008000 | 0x08000000 if sys.platform == 'win32' else 0
+        flags = 0x00004000 | 0x00000008 if sys.platform == 'win32' else 0
         cmd = [dxc_path, "-T", "ps_6_6", "-O3", "-Vd", "-E", "PSMain", "-HV", "2021", "-all_resources_bound", shader_file, "-Fo", "NUL"]
         result = subprocess.run(
             cmd,
@@ -315,13 +315,17 @@ class IoStress:
         buf = ctypes.create_string_buffer(8192); addr = (ctypes.addressof(buf) + 4095) & ~4095
         read = wintypes.DWORD(); rng = random.Random(); max_s = (self.s - 4096) // 4096
         while not self.stop_event.is_set():
-            if (time.time() % 60) < 30: time.sleep(1.0); continue
+            # ALWAYS ACTIVE I/O
             k32.SetFilePointer(h, rng.randint(0, max_s)*4096, None, 0)
             k32.ReadFile(h, ctypes.c_void_p(addr), 4096, ctypes.byref(read), None)
-            time.sleep(0.0001)
+            # No sleep
         k32.CloseHandle(h)
 
 def noise_entry(stop, q, d):
+    try:
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00000080) # HIGH
+    except: pass
+
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         ts = []
@@ -404,22 +408,18 @@ def real_main(input_args=None):
     if input_args: args = p.parse_args(input_args)
     else: args = p.parse_args()
 
-    # --- LOGIC: ADJUST THREAD COUNT ---
+    # --- UNIFIED THREAD LOGIC ---
+    # Always reserve 4 cores for Noise, even in variable mode
     actual_threads = args.threads
     if actual_threads == -1:
-        if args.mode == "steady":
-            # Balanced saturation: Leaves 3 cores for noise/OS to ensure 99% load
-            actual_threads = max(1, LOGICAL_CORES - 3)
-        else:
-            # Variable mode uses full core count for chaos
-            actual_threads = LOGICAL_CORES
+        actual_threads = max(1, LOGICAL_CORES - 4)
 
     global target_active, pulse_barrier
     if args.mode == "variable": pulse_barrier = threading.Barrier(actual_threads)
 
     dxc = get_dxc_path(args.dxc)
     print(f"{Colors.HEADER}=== UE5 Stress: FINAL EDITION ==={Colors.ENDC}")
-    print(f"Threads: {actual_threads} | Mode: {args.mode} | Priority: ABOVE_NORMAL")
+    print(f"Threads: {actual_threads} | Mode: {args.mode} | Priority: BELOW_NORMAL")
 
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
@@ -506,7 +506,7 @@ def real_main(input_args=None):
 
                 last_rate_update = now
 
-            io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}" if (elapsed%60)>=30 else " [IO: OFF]"
+            io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}" # Always Active
             int_s = f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}"
             color = Colors.OKGREEN if "IDLE" in phase else (Colors.FAIL if "SPIKE" in phase else Colors.WARNING)
 
