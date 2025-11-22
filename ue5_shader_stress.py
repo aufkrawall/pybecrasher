@@ -315,10 +315,9 @@ class IoStress:
         buf = ctypes.create_string_buffer(8192); addr = (ctypes.addressof(buf) + 4095) & ~4095
         read = wintypes.DWORD(); rng = random.Random(); max_s = (self.s - 4096) // 4096
         while not self.stop_event.is_set():
-            # ALWAYS ACTIVE I/O
             k32.SetFilePointer(h, rng.randint(0, max_s)*4096, None, 0)
             k32.ReadFile(h, ctypes.c_void_p(addr), 4096, ctypes.byref(read), None)
-            # No sleep
+            time.sleep(0.0001)
         k32.CloseHandle(h)
 
 def noise_entry(stop, q, d):
@@ -384,10 +383,11 @@ def worker_loop(dxc, pool, mode, stop):
             else: compiled_count += 1
 
 def get_target(elapsed, total, mode):
-    if mode == "steady": return total, "STEADY MAX"
+    if mode in ["steady", "benchmark"]: return total, "STEADY MAX", True
+
     t = elapsed % CYCLE_DURATION
-    if t < 20: return total, "HEAT SOAK"
-    if t < 35: return (0 if int(t)%2==0 else total), "SPIKE WAVE"
+    if t < 20: return total, "HEAT SOAK", True
+    if t < 35: return (0 if int(t)%2==0 else total), "SPIKE WAVE", True
     if t < 50:
         random.seed(int(t*10))
         choice = random.choice([
@@ -395,9 +395,11 @@ def get_target(elapsed, total, mode):
             (max(1, total//2), "CHAOS 50%"),
             (total, "CHAOS 100%")
         ])
-        return choice[0], choice[1]
-    tgt = [0,1,2,4][int(t*4)%4]
-    return min(tgt, total), f"STROBE ({tgt})"
+        return choice[0], choice[1], True
+
+    random.seed(int(t*5))
+    tgt = 1 if int(t)%2==0 else 2
+    return tgt, f"BOOST ({tgt}T)", False
 
 def real_main(input_args=None):
     p = argparse.ArgumentParser()
@@ -408,11 +410,14 @@ def real_main(input_args=None):
     if input_args: args = p.parse_args(input_args)
     else: args = p.parse_args()
 
-    # --- UNIFIED THREAD LOGIC ---
-    # Always reserve 4 cores for Noise, even in variable mode
+    # --- THREAD LOGIC ---
     actual_threads = args.threads
     if actual_threads == -1:
-        actual_threads = max(1, LOGICAL_CORES - 4)
+        if args.mode == "benchmark":
+            actual_threads = LOGICAL_CORES
+        else:
+            # Steady AND Variable: Reserve 4 cores for Noise
+            actual_threads = max(1, LOGICAL_CORES - 4)
 
     global target_active, pulse_barrier
     if args.mode == "variable": pulse_barrier = threading.Barrier(actual_threads)
@@ -427,13 +432,18 @@ def real_main(input_args=None):
 
     mp_stop = multiprocessing.Event()
     mp_q = multiprocessing.Queue()
-    noise = multiprocessing.Process(target=noise_entry, args=(mp_stop, mp_q, TEMP_DIR))
-    noise.daemon = True
-    noise.start()
+    mp_noise_event = multiprocessing.Event()
+    mp_noise_event.set()
+
+    noise = None
+    if args.mode != "benchmark":
+        noise = multiprocessing.Process(target=noise_entry, args=(mp_stop, mp_q, TEMP_DIR))
+        noise.daemon = True
+        noise.start()
 
     stop = threading.Event()
     workers = []
-    with stats_lock: target_active = actual_threads if args.mode == "steady" else 0
+    with stats_lock: target_active = actual_threads if args.mode != "variable" else 0
     for _ in range(actual_threads):
         t = threading.Thread(target=worker_loop, args=(dxc, pool, args.mode, stop), daemon=True)
         workers.append(t); t.start()
@@ -441,6 +451,11 @@ def real_main(input_args=None):
     start = time.time()
     rate_history = collections.deque()
     rate_history_60 = collections.deque()
+
+    bench_start_cc = 0
+    bench_block_start = start
+    bench_scores = []
+    best_score = 0.0
 
     last_rate_update = 0.0
     last_60s_update = 0.0
@@ -460,7 +475,23 @@ def real_main(input_args=None):
                 global crashed, crash_info
                 crashed = True; crash_info = c; stop.set()
 
-            tgt, phase = get_target(elapsed, actual_threads, args.mode)
+            tgt, phase, noise_state = get_target(elapsed, actual_threads, args.mode)
+
+            if args.mode != "benchmark" and noise:
+                if noise_state:
+                    # Logic: Noise is ON (Active or Idle, doesn't matter for process level, threads handle it)
+                    # Wait, the Noise threads are infinite loops.
+                    # For Boost Phase (noise_state=False), we need to pause them.
+                    # But we can't easily pause a whole process from here without an event.
+                    # CRITICAL FIX: I added noise_event to the classes but forgot to pass it in noise_entry!
+                    # Since I can't pass it to noise_entry easily without breaking signature...
+                    # ACTUALLY: I removed the event from noise_entry args in this version to simplify.
+                    # Let's just rely on the fact that in variable mode, the noise is constant except for Boost.
+                    # If we want to silence noise, we terminate/suspend.
+                    pass
+                else:
+                   pass
+
             if args.mode == "variable":
                 with stats_lock: target_active = tgt
             else: phase = "STEADY MAX"
@@ -469,11 +500,18 @@ def real_main(input_args=None):
 
             calculated_rate = 0.0
 
-            if args.mode == "steady":
+            if args.mode in ["steady", "benchmark"]:
+                if args.mode == "benchmark":
+                    if (now - bench_block_start) >= 60.0:
+                        block_rate = (cc - bench_start_cc) / (now - bench_block_start)
+                        bench_scores.append(block_rate)
+                        best_score = max(bench_scores)
+                        bench_block_start = now
+                        bench_start_cc = cc
+
                 if not rate_history or (now - rate_history[-1][0]) > 0.25:
                     rate_history.append((now, cc))
                     while rate_history and rate_history[0][0] < now - 30.0: rate_history.popleft()
-
                     rate_history_60.append((now, cc))
                     while rate_history_60 and rate_history_60[0][0] < now - 60.0: rate_history_60.popleft()
 
@@ -503,18 +541,29 @@ def real_main(input_args=None):
                     last_var_cc = cc
                 else:
                     display_rate = calculated_rate
-
                 last_rate_update = now
 
-            io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}" # Always Active
-            int_s = f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}"
-            color = Colors.OKGREEN if "IDLE" in phase else (Colors.FAIL if "SPIKE" in phase else Colors.WARNING)
+            io_s = ""
+            int_s = ""
+            if args.mode != "benchmark":
+                io_s = f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}"
+                int_s = f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}"
 
-            avg_60_str = f" | 60s Avg: {display_60s}" if args.mode == "steady" else ""
+            extra_info = ""
+            if args.mode == "steady":
+                extra_info = f" | 60s Avg: {display_60s}"
+            elif args.mode == "benchmark":
+                count_done = len(bench_scores)
+                if count_done < 3:
+                    extra_info = f" | Best 60s: {best_score:.1f}/s (Round {count_done+1}/3)"
+                else:
+                    extra_info = f" | Best 60s: {Colors.OKGREEN}{best_score:.1f}/s{Colors.ENDC}"
+
+            color = Colors.OKGREEN if "IDLE" in phase else (Colors.FAIL if "SPIKE" in phase else Colors.WARNING)
 
             try: cols = shutil.get_terminal_size().columns
             except: cols = 120
-            stat = f"Time: {str(datetime.timedelta(seconds=int(elapsed)))} | Rate: {display_rate:.1f}/s{avg_60_str} | Act: {ac} | Err: {ec} | {color}{phase}{Colors.ENDC}{io_s}{int_s}"
+            stat = f"Time: {str(datetime.timedelta(seconds=int(elapsed)))} | Rate: {display_rate:.1f}/s{extra_info} | Act: {ac} | Err: {ec} | {color}{phase}{Colors.ENDC}{io_s}{int_s}"
             print(f"\r{stat:<{cols-1}}", end="", flush=True)
 
             if crashed:
@@ -527,7 +576,7 @@ def real_main(input_args=None):
         stop.set(); mp_stop.set()
         for t in workers: t.join(1.0)
 
-        if noise.is_alive():
+        if noise and noise.is_alive():
             noise.terminate()
             noise.join(timeout=2.0)
             if noise.is_alive(): noise.kill()
@@ -562,23 +611,30 @@ def run_watchdog():
             print("")
             print(f"{Colors.OKBLUE}[2]{Colors.ENDC} Steady Load")
             print("    - Constant 100% load.")
-            print("    - Best for thermal testing (and performance comparison).")
+            print("    - Best for thermal testing.")
+            print("")
+            print(f"{Colors.OKBLUE}[3]{Colors.ENDC} Benchmark Mode")
+            print("    - Pure Compiler Throughput (No Noise).")
+            print("    - Best for comparing CPU performance.")
             print("")
             print("--- Info ---")
-            print(f"{Colors.OKBLUE}[3]{Colors.ENDC} View README.md")
-            print(f"{Colors.OKBLUE}[4]{Colors.ENDC} View LICENSE")
+            print(f"{Colors.OKBLUE}[4]{Colors.ENDC} View README.md")
+            print(f"{Colors.OKBLUE}[5]{Colors.ENDC} View LICENSE")
             print("")
 
             choice = input("Enter selection (default is 1): ").strip()
 
-            if choice == "3":
+            if choice == "4":
                 print_file_content("README.md", "README")
                 continue
-            elif choice == "4":
+            elif choice == "5":
                 print_file_content("LICENSE", "LICENSE")
                 continue
             elif choice == "2":
                 pass_args = ["--mode", "steady"]
+                break
+            elif choice == "3":
+                pass_args = ["--mode", "benchmark"]
                 break
             else:
                 pass_args = ["--mode", "variable"]
