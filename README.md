@@ -32,12 +32,6 @@ Python's Global Interpreter Lock (GIL) usually prevents 100% CPU utilization in 
 * **I/O Stress (PCIe/NVMe):** Every 30 seconds, a background thread wakes up and hammers the drive (read only, creates a 1GB file for this once). It uses `ctypes` to call the Win32 API `CreateFileW` with `FILE_FLAG_NO_BUFFERING`. This aims to bypass the Windows RAM cache, hopefully forcing physical 4KB random reads from the SSD controller, generating heat and PCIe bus traffic.
 * **RAM Anvil:** Allocates ~70% of total physical RAM and periodically writes to random pages. This tests the Memory Controller (IMC) under load and checks for thermal instability in DIMMs.
 
-### Interpreting Crashes
-The script employs a **Watchdog** wrapper. If the test closes, check the output:
-* `0xC0000005` (Access Violation): Usually VCore too low or RAM unstable.
-* `0xC0000428` (Integrity Checksum): CPU/Cache calculation error (Core instability).
-* **Hard Reboot:** PSU or severe voltage instability (Vdroop).
-
 ### Modes
 * **Variable Mode:** Introduces a "Power Virus Pulse" where all threads synchronize to drop load and spike simultaneously every 5 seconds. This tests **Transient Response** (VRM voltage regulation stability).
 * **Steady Mode:** Attempts to pin the CPU to 100% usage constantly. The "Rate" displayed is a **rolling average over the last 5 seconds**, giving you real-time feedback on compile speed as seen in games.
