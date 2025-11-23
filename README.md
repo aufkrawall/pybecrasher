@@ -7,7 +7,22 @@ Vibe-scripted Python-based CPU stress test mimicking UE5 workloads
 AI-generated and edited description:
 ## Script Functionality and Process
 
-The primary function of this script is to execute a rigorous, controlled hardware stress test by simulating the most resource-intensive aspects of a game engine's asset pipeline.
+The primary function of this script is to execute a controlled hardware stress test by simulating the most resource-intensive aspects of a game engine's asset pipeline.
+
+## 🛡️ Safety & Security
+
+### 1. Antivirus False Positives
+If you download the binary version (`.exe`), your antivirus (e.g., Windows Defender) may flag it as generic malware (often `Trojan:Win32/Wacatac`).
+*   **Why?** This tool is packaged using **PyInstaller**. Because malware authors often use PyInstaller to hide their code, antivirus heuristics mistakenly flag *any* unsigned PyInstaller executable as suspicious.
+*   **Verification:** You can verify the safety of this tool by ignoring the `.exe` and running the raw Python script (`ue5_shader_stress.py`) directly. The source code is open, transparent, and readable.
+
+### 2. External Downloads (DXC.exe)
+This tool requires the **Microsoft DirectX Shader Compiler**. It does **not** ship with this binary included.
+*   **Process:** Upon first run, the script automatically downloads `dxc.exe`.
+*   **Source:** The download occurs **directly** from Microsoft's official GitHub repository (`github.com/microsoft/DirectXShaderCompiler`).
+*   **Safety:** The script does not connect to any third-party mirrors or private servers.
+
+---
 
 ## ⚙️ Internal Mechanics & Architecture
 
@@ -20,7 +35,7 @@ The primary function of this script is to execute a rigorous, controlled hardwar
 Instead of compiling actual game assets, the script generates **synthetic HLSL shaders**:
 * **Shaders:** These shaders mix **Floating Point (AVX/FMA)** and **Integer (Bitwise/ALU)** instructions in parallel.
 * **Complexity:** Shaders utilize massive loop counts (up to 1,000,000 steps) and `#unroll` directives to force the compiler to generate huge instruction streams, maximizing the time the CPU spends in "User Mode" doing math.
-* **Randomization:** A pool of unique shaders is pre-generated at startup. Worker threads randomly select a file from this pool for every job. This (hopefully) thrashes the CPU branch predictor and prevents the OS from caching the compilation result effectively.
+* **Randomization:** Shaders for variable and steady modes are constantly randomy generated and unique. This (hopefully) thrashes the CPU branch predictor and prevents the OS from caching the compilation result effectively.
 * **Why it is only a partial shader compile load:** This test employs frontend compiling (HLSL to DXIL/IR), whereas the GPU driver performs the backend compiling (DXIL to GPU ISA). This is as close as we can get to real-world loads, and hopefully should work well enough.
 
 ### 3. Architecture: Bypassing the Python Bottleneck
@@ -29,13 +44,20 @@ Python's Global Interpreter Lock (GIL) usually prevents 100% CPU utilization in 
 * **Busy Wait Strategy:** In "Variable" mode, threads utilize busy-wait loops (burning cycles) instead of sleeping, ensuring the CPU core never enters a low-power C-state even while waiting for a task slot.
 
 ### 4. Subsystem Stress Modules
-* **Oodle Simulation (ALU Integrity):** The script uses `zlib` decompression in a tight loop as a proxy for Oodle/Kraken workloads. It verifies the CRC32 checksum of every decompressed block. On errors, this thread will crash with an **Integrity Failure**.
+* **Oodle Simulation (ALU Integrity):** Runs parallel **zlib** and **LZMA** decompression loops, mimicking game asset loading.
 * **I/O Stress (PCIe/NVMe):** Every 30 seconds, a background thread wakes up and hammers the drive (read only, creates a 1GB file for this once). It uses `ctypes` to call the Win32 API `CreateFileW` with `FILE_FLAG_NO_BUFFERING`. This aims to bypass the Windows RAM cache, hopefully forcing physical 4KB random reads from the SSD controller, generating heat and PCIe bus traffic.
-* **RAM Anvil:** Allocates ~70% of total physical RAM and periodically writes to random pages. This tests the Memory Controller (IMC) under load and checks for thermal instability in DIMMs.
+* **Integrity Checking:** Verifies data using **CRC32** and **BLAKE2b** hashes. A single flipped bit causes an immediate crash report.
+* **RAM Anvil:** Allocates ~70% of total RAM. It performs **Random Pointer Chasing**, forcing the CPU to stall and wait for main memory, stressing the Memory Controller (IMC).
 
 ### Modes
 * **Variable Mode:** Introduces a "Power Virus Pulse" where all threads synchronize to drop load and spike simultaneously every 5 seconds. This tests **Transient Response** (VRM voltage regulation stability).
 * **Steady Mode:** Attempts to pin the CPU to 100% usage constantly. The "Rate" displayed is a **rolling average over the last 5 seconds**, giving you real-time feedback on compile speed as seen in games.
+* **Benchmark:** Pure compiler throughput test (Noise disabled). Uses deterministic seeding for consistent scores between runs.
+
+### Logging
+*   The script creates `pybecrasher.log` upon start.
+*   If the test finishes successfully or is stopped by the user, **the log is automatically deleted**.
+*   If a crash or integrity error occurs, the log is **saved** containing the specific error code and context. When things crash too hard/quickly, log files might not contain the actual crash code.
 
 ## 🚀 USAGE AND EXECUTION
 
@@ -51,6 +73,3 @@ Python's Global Interpreter Lock (GIL) usually prevents 100% CPU utilization in 
 
 1.  Place the included `run.bat` and `ue5_stress.py` files in a local folder.
 2.  Open `run.bat`, no admin privileges required.
-
-
-It might actually be really useful, or total garbage. I do not provide updates, nor fix bugs, except when I do.
