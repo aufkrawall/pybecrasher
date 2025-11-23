@@ -45,7 +45,7 @@ Python's Global Interpreter Lock (GIL) usually prevents 100% CPU utilization in 
 
 ### 4. Subsystem Stress Modules
 * **Oodle Simulation (ALU Integrity):** Runs parallel **zlib** and **LZMA** decompression loops, mimicking game asset loading.
-* **I/O Stress (PCIe/NVMe):** Every 30 seconds, a background thread wakes up and hammers the drive (read only, creates a 1GB file for this once). It uses `ctypes` to call the Win32 API `CreateFileW` with `FILE_FLAG_NO_BUFFERING`. This aims to bypass the Windows RAM cache, hopefully forcing physical 4KB random reads from the SSD controller, generating heat and PCIe bus traffic.
+* **I/O Stress (PCIe/NVMe):** A background thread constantly causes drive read-accesses (creates a 1GB file for this once). It uses `ctypes` to call the Win32 API `CreateFileW` with `FILE_FLAG_NO_BUFFERING`. This aims to bypass the Windows RAM cache, hopefully forcing physical 4KB random reads from the SSD controller, generating heat and PCIe bus traffic.
 * **Integrity Checking:** Verifies data using **CRC32** and **BLAKE2b** hashes. A single flipped bit causes an immediate crash report.
 * **RAM Anvil:** Allocates ~70% of total RAM. It performs **Random Pointer Chasing**, forcing the CPU to stall and wait for main memory, stressing the Memory Controller (IMC).
 
