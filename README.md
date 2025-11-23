@@ -72,5 +72,6 @@ Python's Global Interpreter Lock (GIL) usually prevents 100% CPU utilization in 
 
 ### Running the Test
 
-1.  Place the included `run.bat` and `ue5_stress.py` files in a local folder.
-2.  Open `run.bat`, no admin privileges required.
+1. Unpack folder and run `pybecrasher.exe` or
+2. Install Python, open folder path in `cmd.exe` and type `python ue5_shader_stress.py`, if you prefer transparent non-binary source.
+3. In both cases, no admin privileges required.
