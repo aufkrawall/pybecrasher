@@ -51,7 +51,7 @@ Python's Global Interpreter Lock (GIL) usually prevents 100% CPU utilization in 
 
 ### Modes
 * **Variable Mode:** Introduces a "Power Virus Pulse" where all threads synchronize to drop load and spike simultaneously every 5 seconds. This tests **Transient Response** (VRM voltage regulation stability).
-* **Steady Mode:** Attempts to pin the CPU to 100% usage constantly. The "Rate" displayed is a **rolling average over the last 5 seconds**, giving you real-time feedback on compile speed as seen in games.
+* **Steady Mode:** Attempts to pin the CPU to 100% usage constantly.
 * **Benchmark:** Pure compiler throughput test (Noise disabled). Uses deterministic seeding for consistent scores between runs.
 
 ### Logging
