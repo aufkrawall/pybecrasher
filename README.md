@@ -36,7 +36,7 @@ Instead of compiling actual game assets, the script generates **synthetic HLSL s
 * **Shaders:** These shaders mix **Floating Point (AVX/FMA)** and **Integer (Bitwise/ALU)** instructions in parallel.
 * **Complexity:** Shaders utilize massive loop counts (up to 1,000,000 steps) and `#unroll` directives to force the compiler to generate huge instruction streams, maximizing the time the CPU spends in "User Mode" doing math.
 * **Randomization:** Shaders for variable and steady modes are constantly randomy generated and unique. This (hopefully) thrashes the CPU branch predictor and prevents the OS from caching the compilation result effectively. Causes a few hundred KB/s storage writes in variable and steady mode.
-* **Why it is only a partial shader compile load:** This test employs frontend compiling (HLSL to DXIL/IR), whereas the GPU driver performs the backend compiling (DXIL to GPU ISA). This is as close as we can get to real-world loads, and hopefully should work well enough.
+* **Why it is only a partial real-world shader compile load:** This test employs frontend compiling (HLSL to DXIL/IR), whereas the GPU driver performs the backend compiling (DXIL to GPU ISA). This is as close as we can get to real-world loads, and hopefully should work well enough.
 
 ### 3. Architecture: Bypassing the Python Bottleneck
 Python's Global Interpreter Lock (GIL) usually prevents 100% CPU utilization in multithreaded apps. This script circumvents this:
