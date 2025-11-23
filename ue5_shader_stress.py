@@ -1,5 +1,4 @@
 # MIT License
-#
 # Copyright (c) 2024 aufkrawall
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -35,33 +34,31 @@ import threading
 import ctypes
 import zlib
 import multiprocessing
-import collections
 import signal
 import hashlib
 import lzma
+import platform
 from ctypes import wintypes
 
-# --- Configuration ---
-DXC_DOWNLOAD_URL = (
-    "https://github.com/microsoft/DirectXShaderCompiler/releases/"
-    "download/v1.8.2407/dxc_2024_07_31.zip"
-)
-DXC_LOCAL_DIR = "dxc_bin"
-TEMP_DIR = "temp_shaders"
+# ==============================================================================
+# CONFIGURATION & CONSTANTS
+# ==============================================================================
 
-LOGICAL_CORES = os.cpu_count()
-# Default to -1 to indicate "Auto-tuning" based on mode
-DEFAULT_WORKERS = -1
+VERSION = "7.0"
+
+DXC_CONFIG = {
+    "URL": "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2407/dxc_2024_07_31.zip",
+    "DIR": "dxc_bin",
+    "TEMP": "temp_shaders"
+}
+
+LOG_FILE = "pybecrasher.log"
+SYSTEM_CORES = os.cpu_count() or 1
 CYCLE_DURATION = 60
-
-# Pulse configuration for Chaos mode barrier sync
-PULSE_INTERVAL = 5.0
-PULSE_DURATION = 0.5
-
-# Maximum noise threads to attempt spawning (1 Ram, 1 Cache, 2 Integrity, 1 IO)
 MAX_NOISE_THREADS = 5
 
-CRASH_EXIT_CODES = {
+# Windows Error Codes relevant to hardware instability
+CRASH_CODES = {
     -1073741819: "Access Violation (0xC0000005) - RAM/Vcore Unstable",
     3221225477: "Access Violation (0xC0000005) - RAM/Vcore Unstable",
     -1073741571: "Stack Overflow (0xC00000FD)",
@@ -70,7 +67,7 @@ CRASH_EXIT_CODES = {
     3221226505: "Stack Buffer Overrun (0xC0000409)",
     -1073741676: "Integer Divide by Zero (0xC0000094)",
     3221225620: "Integer Divide by Zero (0xC0000094)",
-    0xC0000428: "Integrity Checksum Failure (Core/RAM Calculation Error)",
+    0xC0000428:  "Integrity Checksum Failure (CPU/RAM Calc Error)",
 }
 
 class Colors:
@@ -80,1082 +77,547 @@ class Colors:
     WARNING = "\033[93m"
     FAIL = "\033[91m"
     ENDC = "\033[0m"
-    BOLD = "\033[1m"
 
+# ==============================================================================
+# UTILITIES
+# ==============================================================================
 
-# --- RESOURCE HELPER ---
+class SysUtils:
+    @staticmethod
+    def set_timer_resolution():
+        """Sets Windows timer resolution to 1ms for accurate loops."""
+        try: ctypes.windll.winmm.timeBeginPeriod(1)
+        except: pass
 
-def get_resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS  # type: ignore[attr-defined]
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+    @staticmethod
+    def get_total_ram():
+        """Returns total physical RAM in bytes."""
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        return stat.ullTotalPhys
 
+    @staticmethod
+    def get_resource_path(filename):
+        """Locates external files (README/LICENSE) either in bundle or local dir."""
+        if os.path.exists(filename):
+            return os.path.abspath(filename)
+        if hasattr(sys, '_MEIPASS'):
+            return os.path.join(sys._MEIPASS, filename)
+        return None
 
-def print_file_content(filename, title):
-    path = get_resource_path(filename)
-    os.system("cls" if os.name == "nt" else "clear")
-    print(f"{Colors.HEADER}=== {title} ==={Colors.ENDC}\n")
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                print(f.read())
+    @staticmethod
+    def print_file_content(filename, title):
+        path = SysUtils.get_resource_path(filename)
+        SysUtils.clear_screen()
+        print(f"{Colors.HEADER}=== {title} ==={Colors.ENDC}\n")
+        try:
+            if path and os.path.exists(path):
+                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                    print(f.read())
+            else:
+                print(f"{Colors.FAIL}File '{filename}' not found.{Colors.ENDC}")
+        except Exception as e:
+            print(f"Error reading file: {e}")
+        print(f"\n{Colors.OKBLUE}{'='*40}{Colors.ENDC}")
+        input("\nPress Enter to return...")
+
+    @staticmethod
+    def clear_screen():
+        os.system("cls" if os.name == "nt" else "clear")
+
+# ==============================================================================
+# LOGGING SYSTEM
+# ==============================================================================
+
+class CrashLogger:
+    @staticmethod
+    def start_log(mode, threads):
+        """Initialize log file. Overwrites previous log."""
+        try:
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.write(f"=== PyBeCrasher v{VERSION} Session Log ===\n")
+                f.write(f"Start Time: {datetime.datetime.now()}\n")
+                f.write(f"System: {platform.system()} {platform.release()} ({platform.machine()})\n")
+                f.write(f"CPU Cores: {SYSTEM_CORES}\n")
+                f.write(f"Mode: {mode}\n")
+                f.write(f"Thread Config: {threads}\n")
+                f.write("-------------------------------------------\n")
+                f.write("Status: RUNNING\n")
+        except: pass
+
+    @staticmethod
+    def log_failure(code, reason, context):
+        """Append crash details to log."""
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"\n!!! HARDWARE FAILURE DETECTED at {datetime.datetime.now()} !!!\n")
+                f.write(f"Exit Code: {code} ({hex(code & 0xFFFFFFFF)})\n")
+                f.write(f"Reason:    {reason}\n")
+                f.write(f"Context:   {context}\n")
+        except: pass
+
+    @staticmethod
+    def cleanup_log():
+        """Delete log if no crash occurred."""
+        if os.path.exists(LOG_FILE):
+            try: os.remove(LOG_FILE)
+            except: pass
+
+# ==============================================================================
+# ASSET GENERATION (DXC & SHADERS)
+# ==============================================================================
+
+class AssetManager:
+    SHADER_RAM = """
+    struct PS_INPUT {{ float4 Pos : SV_POSITION; float2 UV : TEXCOORD; }};
+    static const float4 DATA[{size}] = {{ {data} }};
+    float4 PSMain(PS_INPUT i) : SV_TARGET {{
+        uint idx = (uint)(abs(i.Pos.x)*100000.0) % {size};
+        float4 acc = 0;
+        [loop] for(int k=0; k<{steps}; k++) {{
+            acc = mad(acc, DATA[(idx + k*127) % {size}], 0.0001);
+        }}
+        return acc;
+    }}"""
+
+    SHADER_HYBRID = """
+    #define MAX_STEPS {steps}
+    struct PS_INPUT {{ float4 Pos : SV_POSITION; float2 UV : TEXCOORD; }};
+    float4 PSMain(PS_INPUT input) : SV_TARGET {{
+        float4 f = float4(input.UV, 1.0, 0.5);
+        uint4 i = uint4(1, 2, 3, 4);
+        [unroll({unroll})] for(int k=0; k<MAX_STEPS; k++) {{
+            f = mad(f, 0.123, 0.456);
+            i = (i << 1) ^ (i >> 1) ^ 0xA5A5A5A5;
+            if((k&127)==0) f += sin(f);
+        }}
+        return f + (float4)i;
+    }}"""
+
+    @staticmethod
+    def get_dxc_binary():
+        """Locates or downloads the DXC binary."""
+        bin_path = os.path.abspath(os.path.join(DXC_CONFIG["DIR"], "bin", "dxc.exe"))
+        if os.path.exists(bin_path): return bin_path
+
+        print(f"{Colors.WARNING}Downloading DirectXShaderCompiler from Microsoft GitHub...{Colors.ENDC}")
+        try:
+            if not os.path.exists(DXC_CONFIG["DIR"]): os.makedirs(DXC_CONFIG["DIR"])
+            req = urllib.request.Request(DXC_CONFIG["URL"], headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as r:
+                with zipfile.ZipFile(io.BytesIO(r.read())) as z:
+                    for f in z.namelist():
+                        if f.startswith("bin/x64/"): z.extract(f, DXC_CONFIG["DIR"])
+
+            # Flatten folder structure
+            src = os.path.join(DXC_CONFIG["DIR"], "bin", "x64")
+            dst = os.path.join(DXC_CONFIG["DIR"], "bin")
+            if os.path.exists(src):
+                for f in os.listdir(src): shutil.move(os.path.join(src, f), dst)
+                os.rmdir(src)
+            return bin_path
+        except Exception as e:
+            print(f"{Colors.FAIL}Download Failed: {e}{Colors.ENDC}")
+            sys.exit(1)
+
+    @staticmethod
+    def setup_workspace():
+        if os.path.exists(DXC_CONFIG["TEMP"]): shutil.rmtree(DXC_CONFIG["TEMP"])
+        os.makedirs(DXC_CONFIG["TEMP"])
+
+    @staticmethod
+    def generate_shader_code(rng):
+        """Just-in-time shader code generation using the provided RNG instance."""
+        if rng.random() < 0.4:
+            ram_data = ",".join([f"float4({rng.random():.4f},0,0,0)" for _ in range(16384)])
+            return AssetManager.SHADER_RAM.format(size=16384, data=ram_data, steps=rng.randint(60000, 100000))
         else:
-            print(
-                f"{Colors.FAIL}File '{filename}' not found in bundle."
-                f"{Colors.ENDC}"
-            )
-    except Exception as e:
-        print(f"Error reading file: {e}")
-    print(f"\n{Colors.OKBLUE}========================================{Colors.ENDC}")
-    try:
-        input("\nPress Enter to return to menu...")
-    except KeyboardInterrupt:
-        # Menu loop handles this
-        pass
+            return AssetManager.SHADER_HYBRID.format(steps=rng.randint(600000, 1000000), unroll=1024)
 
+# ==============================================================================
+# NOISE SUB-SYSTEM (Running in separate process)
+# ==============================================================================
 
-# --- SYSTEM TUNING (Windows timer resolution) ---
+class NoiseModules:
+    class RamAnvil:
+        def __init__(self, stop, trigger): self.stop, self.trigger = stop, trigger
+        def run(self):
+            try:
+                sz = int(SysUtils.get_total_ram() * 0.70)
+                buf = bytearray(sz)
+                view = memoryview(buf)
+                max_idx = sz - 4096
+                for i in range(0, sz, 409600): buf[i] = 1
+            except: return
 
-try:
-    ctypes.windll.winmm.timeBeginPeriod(1)
-except Exception:
-    pass
+            rng = random.Random()
+            while not self.stop.is_set():
+                if not self.trigger.is_set(): time.sleep(0.1); continue
+                try:
+                    mode = rng.randint(0, 10)
+                    idx = rng.randint(0, max_idx)
+                    if mode < 6: view[idx] = rng.randint(0, 255)
+                    elif mode < 9:
+                        base = (idx // 4096) * 4096
+                        view[base] ^= 0xFF
+                    else:
+                        end = min(idx + 4096, sz)
+                        for i in range(idx, end, 64): view[i] += 1
+                except: break
 
+    class IntegrityStress:
+        def __init__(self, stop, q, trigger): self.stop, self.q, self.trigger = stop, q, trigger
+        def run(self):
+            raw = os.urandom(1024 * 16384)
+            hashes = {
+                'crc': zlib.crc32(raw) & 0xFFFFFFFF,
+                'blake': hashlib.blake2b(raw, digest_size=32).digest()
+            }
+            blobs = {
+                'zlib': zlib.compress(raw, level=6),
+                'lzma': lzma.compress(raw, preset=6)
+            }
 
-class MEMORYSTATUSEX(ctypes.Structure):
-    _fields_ = [
-        ("dwLength", wintypes.DWORD),
-        ("dwMemoryLoad", wintypes.DWORD),
-        ("ullTotalPhys", ctypes.c_ulonglong),
-        ("ullAvailPhys", ctypes.c_ulonglong),
-        ("ullTotalPageFile", ctypes.c_ulonglong),
-        ("ullAvailPageFile", ctypes.c_ulonglong),
-        ("ullTotalVirtual", ctypes.c_ulonglong),
-        ("ullAvailVirtual", ctypes.c_ulonglong),
-        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            while not self.stop.is_set():
+                if not self.trigger.is_set(): time.sleep(0.1); continue
+                try:
+                    for alg, blob in blobs.items():
+                        data = zlib.decompress(blob) if alg == 'zlib' else lzma.decompress(blob)
+
+                        if (zlib.crc32(data) & 0xFFFFFFFF) != hashes['crc']:
+                            self.q.put((0xC0000428, "CRC FAILURE", f"{alg.upper()} Decomp Mismatch"))
+                            self.stop.set(); return
+
+                        if hashlib.blake2b(data, digest_size=32).digest() != hashes['blake']:
+                            self.q.put((0xC0000428, "HASH FAILURE", f"{alg.upper()} Blake2b Mismatch"))
+                            self.stop.set(); return
+                except Exception: pass
+
+    class IoStress:
+        def __init__(self, stop, folder, trigger):
+            self.stop, self.f, self.trigger = stop, os.path.join(folder, "io.dat"), trigger
+
+        def run(self):
+            if not os.path.exists(self.f):
+                with open(self.f, "wb") as f: f.write(os.urandom(1024*1024*1024))
+
+            k32 = ctypes.windll.kernel32
+            h = k32.CreateFileW(self.f, 0x80000000, 0, None, 3, 0x20000000, None)
+            if h == -1: return
+
+            buf = ctypes.create_string_buffer(4096 + 4095)
+            aligned_buf = (ctypes.addressof(buf) + 4095) & ~4095
+            rng = random.Random()
+            max_pos = (1024*1024*1024 - 4096) // 4096
+            read_bytes = wintypes.DWORD()
+
+            try:
+                while not self.stop.is_set():
+                    if not self.trigger.is_set(): time.sleep(0.1); continue
+                    k32.SetFilePointer(h, rng.randint(0, max_pos) * 4096, None, 0)
+                    k32.ReadFile(h, ctypes.c_void_p(aligned_buf), 4096, ctypes.byref(read_bytes), None)
+            finally: k32.CloseHandle(h)
+
+def noise_process_entry(stop_evt, msg_queue, temp_dir, active_evt, thread_limit):
+    """Entry point for the isolated noise process."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    modules = [
+        NoiseModules.IntegrityStress(stop_evt, msg_queue, active_evt),
+        NoiseModules.RamAnvil(stop_evt, active_evt),
+        NoiseModules.IntegrityStress(stop_evt, msg_queue, active_evt),
+        NoiseModules.IoStress(stop_evt, temp_dir, active_evt),
+        NoiseModules.RamAnvil(stop_evt, active_evt)
     ]
 
-
-def get_total_ram():
-    stat = MEMORYSTATUSEX()
-    stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
-    return stat.ullTotalPhys
-
-
-# --- SHADER TEMPLATES ---
-
-# Hybrid ALU + integer bit-twiddling workload
-SHADER_TEMPLATE_HYBRID = """
-#define MAX_STEPS {steps}
-struct PS_INPUT {{ float4 Pos : SV_POSITION; float2 UV : TEXCOORD; }};
-float4 PSMain(PS_INPUT input) : SV_TARGET {{
-    float4 f0 = float4(input.UV, 1.0, 0.5);
-    float4 f1 = float4(input.UV.yx, 0.5, 1.0);
-    float4 f2 = float4(0.1, 0.2, 0.3, 0.4);
-    float4 f3 = float4(0.9, 0.8, 0.7, 0.6);
-    float4 c1 = float4(0.123, 0.456, 0.789, 1.234);
-
-    uint4 i0 = uint4(1, 2, 3, 4);
-    uint4 i1 = uint4(5, 6, 7, 8);
-    uint4 i2 = uint4(9, 10, 11, 12);
-    uint4 magic = uint4(0xA5A5A5A5, 0x5A5A5A5A, 0xFF00FF00, 0x00FF00FF);
-
-    [unroll({unroll_factor})]
-    for (int i = 0; i < MAX_STEPS; i++) {{
-        f0 = mad(f1, c1, f2);
-        f1 = mad(f2, c1, f3);
-        f2 = mad(f3, c1, f0);
-        f3 = mad(f0, c1, f1);
-
-        i0 = (i0 << 1) ^ i1;
-        i1 = (i1 >> 1) ^ i2;
-        i2 = (i2 << 3) ^ i0 ^ magic;
-
-        if ((i & 127) == 0) {{
-            f0 = sin(f0) * cos(f1);
-            f3 += (float4)i0 * 0.00001;
-        }}
-    }}
-    return f0 + f1 + f2 + f3 + (float4)i0 + (float4)i1;
-}}
-"""
-
-# RAM-heavy template using large static array and pseudo-random indexing
-SHADER_TEMPLATE_RAM = """
-struct PS_INPUT {{ float4 Pos : SV_POSITION; float2 UV : TEXCOORD; }};
-static const float4 DATA_BLOCK[{array_size}] = {{ {array_data} }};
-float4 PSMain(PS_INPUT input) : SV_TARGET {{
-    uint idx = (uint)(abs(input.Pos.x) * 100000.0) % {array_size};
-    float4 r0 = float4(input.UV, 0.5, 0.5);
-    float4 r1 = float4(input.UV.yx, 0.2, 0.8);
-    float4 acc = float4(0,0,0,0);
-    [loop]
-    for (int i = 0; i < {steps}; i++) {{
-        uint j = (idx + (uint)(i * 127)) % {array_size};
-        float4 m = DATA_BLOCK[j];
-        r0 = mad(r1, r0, m);
-        acc += r0 * 0.0001;
-    }}
-    return acc;
-}}
-"""
-
-# Extra template: more transcendentals + control flow, smaller iteration count
-SHADER_TEMPLATE_TRANS = """
-#define MAX_STEPS {steps}
-struct PS_INPUT {{ float4 Pos : SV_POSITION; float2 UV : TEXCOORD; }};
-float hash(float2 p) {{
-    return frac(sin(dot(p, float2(12.9898,78.233))) * 43758.5453);
-}}
-float4 PSMain(PS_INPUT input) : SV_TARGET {{
-    float2 uv = input.UV * 10.0;
-    float4 acc = float4(0,0,0,0);
-    float4 r = float4(uv, 1.0, 0.0);
-    [loop]
-    for (int i = 0; i < MAX_STEPS; ++i) {{
-        float h = hash(uv + i);
-        r.xy = float2(cos(h * 6.2831), sin(h * 6.2831));
-        r.zw = float2(tan(h), atan2(r.x, r.y));
-        acc += sin(r * 0.1) * cos(r.yxwz * 0.13);
-        if ((i & 63) == 0) {{
-            uv = uv.yx * 1.0001 + h;
-        }}
-    }}
-    return acc * 0.001 + float4(0.1,0.2,0.3,0.4);
-}}
-"""
-
-RAM_ARRAY_SIZE = 16384
-_ram_data_str = None
-
-
-def build_ram_data():
-    global _ram_data_str
-    if _ram_data_str is not None:
-        return _ram_data_str
-    items = []
-    for _ in range(RAM_ARRAY_SIZE):
-        items.append(
-            "float4({:.6f},{:.6f},{:.6f},{:.6f})".format(
-                random.random(),
-                random.random(),
-                random.random(),
-                random.random(),
-            )
-        )
-    _ram_data_str = ",\n".join(items)
-    return _ram_data_str
-
-
-# --- DXC HELPER ---
-
-def download_and_setup_dxc():
-    bin_path = os.path.abspath(os.path.join(DXC_LOCAL_DIR, "bin", "dxc.exe"))
-    if os.path.exists(bin_path):
-        return bin_path
-    print(f"{Colors.WARNING}dxc.exe not found. Downloading...{Colors.ENDC}")
-    try:
-        if not os.path.exists(DXC_LOCAL_DIR):
-            os.makedirs(DXC_LOCAL_DIR)
-        req = urllib.request.Request(
-            DXC_DOWNLOAD_URL, headers={"User-Agent": "Mozilla/5.0"}
-        )
-        with urllib.request.urlopen(req) as response:
-            data = response.read()
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            for file in z.namelist():
-                if file.startswith("bin/x64/"):
-                    z.extract(file, DXC_LOCAL_DIR)
-        x64_dir = os.path.join(DXC_LOCAL_DIR, "bin", "x64")
-        target_bin = os.path.join(DXC_LOCAL_DIR, "bin")
-        if os.path.exists(x64_dir):
-            for f in os.listdir(x64_dir):
-                shutil.move(os.path.join(x64_dir, f), target_bin)
-            os.rmdir(x64_dir)
-        return bin_path
-    except Exception as e:
-        print(f"{Colors.FAIL}Download failed: {e}{Colors.ENDC}")
-        sys.exit(1)
-
-
-def get_dxc_path(user_arg):
-    if user_arg and os.path.exists(user_arg):
-        return user_arg
-    local_dxc = os.path.abspath(os.path.join(DXC_LOCAL_DIR, "bin", "dxc.exe"))
-    if os.path.exists(local_dxc):
-        return local_dxc
-    sys_dxc = shutil.which("dxc.exe")
-    if sys_dxc:
-        return sys_dxc
-    return download_and_setup_dxc()
-
-
-# --- SHADER GENERATION ---
-
-def generate_shader(filename, seed):
-    random.seed(seed)
-    roll = random.random()
-    # ~30% RAM-heavy, ~50% hybrid, ~20% extra transcendental/control-flow heavy
-    if roll < 0.30:
-        data = build_ram_data()
-        steps = random.randint(60000, 100000)
-        code = SHADER_TEMPLATE_RAM.format(
-            array_size=RAM_ARRAY_SIZE,
-            array_data=data,
-            steps=steps,
-        )
-    elif roll < 0.80:
-        steps = random.randint(600000, 1000000)
-        unroll = 1024
-        code = SHADER_TEMPLATE_HYBRID.format(
-            steps=steps,
-            unroll_factor=unroll,
-        )
-    else:
-        steps = random.randint(150000, 300000)
-        code = SHADER_TEMPLATE_TRANS.format(steps=steps)
-
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(code)
-
-
-def prepare_workload(count):
-    sys.stdout.write(f"Pre-generating {count} shaders... ")
-    sys.stdout.flush()
-    files = []
-    for i in range(count):
-        fname = os.path.join(TEMP_DIR, f"stress_{i}.hlsl")
-        generate_shader(fname, i)
-        files.append(fname)
-    print(f"{Colors.OKGREEN}Done.{Colors.ENDC}")
-    return files
-
-
-def compile_once(dxc_path, shader_file):
-    try:
-        flags = (
-            0x00004000 | 0x00000008
-            if sys.platform == "win32"
-            else 0
-        )
-        cmd = [
-            dxc_path,
-            "-T",
-            "ps_6_6",
-            "-O3",
-            "-Vd",
-            "-E",
-            "PSMain",
-            "-HV",
-            "2021",
-            "-all_resources_bound",
-            shader_file,
-            "-Fo",
-            "NUL",
-        ]
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            creationflags=flags,
-        )
-        if result.returncode != 0:
-            if (
-                result.returncode in CRASH_EXIT_CODES
-                or abs(result.returncode) > 1000000
-            ):
-                return False, f"CRASH: {result.returncode}", result.returncode
-            return False, "Error", result.returncode
-        return True, None, 0
-    except Exception as e:
-        return False, str(e), -1
-
-
-# --- NOISE / STRESS PROCESSES ---
-
-class RamAnvil:
-    def __init__(self, stop_event, noise_event):
-        self.stop_event = stop_event
-        self.noise_event = noise_event
-
-    def start_loop(self):
-        try:
-            total = get_total_ram()
-            size = int(total * 0.70)
-            buf = bytearray(size)
-            for i in range(0, size, 4096 * 100):
-                buf[i] = 1
-        except Exception:
-            return
-
-        rng = random.Random()
-        view = memoryview(buf)
-        max_idx = size - 4096
-
-        page_size = 4096
-        page_count = size // page_size
-        if page_count > 0:
-            idx_table = list(range(page_count))
-            rng.shuffle(idx_table)
-        else:
-            idx_table = []
-        cur_page = 0
-
-        while not self.stop_event.is_set():
-            if not self.noise_event.is_set():
-                time.sleep(0.1)
-                continue
-            try:
-                mode = rng.randint(0, 9)
-                if mode < 5:
-                    idx = rng.randint(0, max_idx)
-                    _ = view[idx]
-                    view[idx] = rng.randint(0, 255)
-                elif mode < 8 and idx_table:
-                    cur_page = idx_table[cur_page]
-                    base = cur_page * page_size
-                    off = rng.randint(0, page_size - 1)
-                    view[base + off] ^= 0xFF
-                else:
-                    base = rng.randint(0, max_idx)
-                    end = min(base + 4096, size)
-                    for i in range(base, end, 128):
-                        view[i] = (view[i] + 1) & 0xFF
-            except Exception:
-                break
-
-
-class CacheTrasher:
-    def __init__(self, stop_event, noise_event):
-        self.stop_event = stop_event
-        self.noise_event = noise_event
-        self.raw = ctypes.create_string_buffer(128)
-        self.align = (ctypes.addressof(self.raw) + 63) & ~63
-
-    def _thrasher(self):
-        while not self.stop_event.is_set():
-            if not self.noise_event.is_set():
-                time.sleep(0.1)
-                continue
-            ctypes.memset(self.align, 1, 1)
-
-    def start_loop(self):
-        t = threading.Thread(target=self._thrasher, daemon=True)
+    threads = []
+    for mod in modules[:thread_limit]:
+        t = threading.Thread(target=mod.run, daemon=True)
         t.start()
-        t.join()
+        threads.append(t)
 
+    while not stop_evt.is_set(): time.sleep(1)
 
-class IntegrityStress:
-    def __init__(self, stop_event, q, noise_event):
-        self.stop_event = stop_event
-        self.q = q
-        self.noise_event = noise_event
+# ==============================================================================
+# MAIN STRESS CONTROLLER
+# ==============================================================================
 
-    def start_loop(self):
-        raw = os.urandom(1024) * 16384  # 16 MiB
-        crc_expected = zlib.crc32(raw) & 0xFFFFFFFF
-        blake_expected = hashlib.blake2b(raw, digest_size=32).digest()
+class StressController:
+    def __init__(self, args):
+        self.args = args
+        self.dxc = AssetManager.get_dxc_binary()
+        self.crashed_state = False
 
-        comp_z = zlib.compress(raw, level=6)
-        comp_lzma = lzma.compress(raw, preset=6)
+        # --- Thread Calculation (Universal v9 Logic) ---
+        self.noise_count = 0 if args.mode == "benchmark" else min(MAX_NOISE_THREADS, max(0, SYSTEM_CORES - 1))
 
-        while not self.stop_event.is_set():
-            if not self.noise_event.is_set():
-                time.sleep(0.1)
-                continue
-            try:
-                # zlib path
-                dec_z = zlib.decompress(comp_z)
-                crc_z = zlib.crc32(dec_z) & 0xFFFFFFFF
-                b_z = hashlib.blake2b(dec_z, digest_size=32).digest()
+        self.comp_count = SYSTEM_CORES
+        if args.mode != "benchmark":
+            # Cores - 3 logic -> Cores + 2 threads total
+            self.comp_count = max(1, SYSTEM_CORES - 3)
 
-                # LZMA path
-                dec_l = lzma.decompress(comp_lzma)
-                crc_l = zlib.crc32(dec_l) & 0xFFFFFFFF
-                b_l = hashlib.blake2b(dec_l, digest_size=32).digest()
+        self.total_threads_display = f"{self.comp_count} (Compilers) + {self.noise_count} (Noise)"
 
-                if (
-                    crc_z != crc_expected
-                    or b_z != blake_expected
-                    or crc_l != crc_expected
-                    or b_l != blake_expected
-                ):
-                    self.q.put(
-                        (
-                            0xC0000428,
-                            "INTEGRITY FAILURE",
-                            "Checksum/Hash Mismatch",
-                        )
-                    )
-                    self.stop_event.set()
-                    break
-            except Exception:
-                pass
+        CrashLogger.start_log(args.mode, self.total_threads_display)
 
+        self.stats = {'act': 0, 'ok': 0, 'err': 0}
+        self.lock = threading.Lock()
+        self.barrier = threading.Barrier(self.comp_count) if args.mode == "variable" else None
+        self.stop = threading.Event()
+        self.mp_stop = multiprocessing.Event()
+        self.mp_queue = multiprocessing.Queue()
+        self.mp_trigger = multiprocessing.Event()
+        self.mp_trigger.set()
 
-class IoStress:
-    def __init__(self, stop_event, d, noise_event, s=1024):
-        self.stop_event = stop_event
-        self.f = os.path.join(d, "io.dat")
-        self.s = s * 1024 * 1024  # MiB -> bytes
-        self.noise_event = noise_event
+    def run(self):
+        print(f"{Colors.HEADER}=== PyBeCrasher v{VERSION} ==={Colors.ENDC}")
+        print(f"Mode: {self.args.mode} | Load: {self.total_threads_display} | Priority: BELOW_NORMAL")
 
-    def start_loop(self):
-        if not os.path.exists(self.f):
-            with open(self.f, "wb") as f:
-                f.write(os.urandom(self.s))
+        AssetManager.setup_workspace()
 
-        k32 = ctypes.windll.kernel32
-        HANDLE = wintypes.HANDLE
-
-        k32.CreateFileW.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            HANDLE,
-        ]
-        k32.CreateFileW.restype = HANDLE
-
-        k32.ReadFile.argtypes = [
-            HANDLE,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD),
-            ctypes.c_void_p,
-        ]
-        k32.ReadFile.restype = wintypes.BOOL
-
-        h = k32.CreateFileW(
-            self.f,
-            0x80000000,
-            0,
-            None,
-            3,
-            0x20000000,
-            None,
-        )
-        if h == HANDLE(-1).value:
-            return
-
-        buf = ctypes.create_string_buffer(8192)
-        addr = (ctypes.addressof(buf) + 4095) & ~4095
-        read = wintypes.DWORD()
-        rng = random.Random()
-        max_s = (self.s - 4096) // 4096
-
-        try:
-            while not self.stop_event.is_set():
-                if not self.noise_event.is_set():
-                    time.sleep(0.1)
-                    continue
-                k32.SetFilePointer(
-                    h,
-                    rng.randint(0, max_s) * 4096,
-                    None,
-                    0,
-                )
-                k32.ReadFile(
-                    h,
-                    ctypes.c_void_p(addr),
-                    4096,
-                    ctypes.byref(read),
-                    None,
-                )
-        finally:
-            k32.CloseHandle(h)
-
-
-def noise_entry(stop, q, d, noise_event, target_noise_count):
-    """
-    Launches noise threads up to target_noise_count.
-    Priority order if we must prune:
-    1. Integrity (Primary)
-    2. RamAnvil
-    3. Integrity (Secondary)
-    4. CacheTrasher
-    5. IoStress
-    """
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    try:
-        # List of potential threads in order of IMPORTANCE/PRIORITY
-        # We add them to this list, then slice based on count
-        candidates = []
-
-        # 1. Primary Integrity (Crucial)
-        candidates.append(IntegrityStress(stop, q, noise_event))
-        # 2. RAM Anvil (Crucial)
-        candidates.append(RamAnvil(stop, noise_event))
-        # 3. Secondary Integrity (Very Good)
-        candidates.append(IntegrityStress(stop, q, noise_event))
-        # 4. Cache Thrashing (Good)
-        candidates.append(CacheTrasher(stop, noise_event))
-        # 5. IO Stress (Lowest Priority if cores are starved)
-        candidates.append(IoStress(stop, d, noise_event))
-
-        # Select top N threads
-        active_workers = candidates[:target_noise_count]
+        noise_proc = None
+        if self.noise_count > 0:
+            noise_proc = multiprocessing.Process(
+                target=noise_process_entry,
+                args=(self.mp_stop, self.mp_queue, DXC_CONFIG["TEMP"], self.mp_trigger, self.noise_count)
+            )
+            noise_proc.daemon = True
+            noise_proc.start()
 
         threads = []
-        for worker in active_workers:
-            t = threading.Thread(target=worker.start_loop, daemon=True)
-            threads.append(t)
+        self.target_active = self.comp_count if self.args.mode != "variable" else 0
+
+        # Launch workers with Thread ID to ensure unique file handles/seeds
+        for i in range(self.comp_count):
+            t = threading.Thread(target=self.compiler_worker, args=(i,))
+            t.daemon = True
             t.start()
+            threads.append(t)
 
-        while not stop.is_set():
-            time.sleep(0.5)
-    except Exception:
-        pass
+        start_time = time.time()
+        try:
+            self._monitor_loop(start_time, noise_proc)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.cleanup(threads, noise_proc)
 
+    def _monitor_loop(self, start_time, noise_proc):
+        bench_data = {'start': start_time, 'cc': 0, 'scores': []}
 
-# --- MAIN PROCESS STATE ---
-
-stats_lock = threading.Lock()
-compiled_count = 0
-error_count = 0
-active_compiles = 0
-target_active = 0
-crashed = False
-crash_info = None
-pulse_barrier = None
-
-
-def worker_loop(dxc, pool, mode, stop):
-    global compiled_count, error_count, active_compiles, crashed, crash_info
-    rng = random.Random()
-    next_pulse = time.time() + random.uniform(0, PULSE_INTERVAL)
-
-    while not stop.is_set():
-        if mode == "variable" and pulse_barrier and time.time() > next_pulse:
-            try:
-                pulse_barrier.wait(timeout=2.0)
-            except Exception:
-                pass
-            time.sleep(PULSE_DURATION)
-            next_pulse = (
-                time.time() + PULSE_INTERVAL + random.uniform(-1, 1)
-            )
-
-        wait = False
-        if mode == "variable":
-            with stats_lock:
-                if active_compiles >= target_active:
-                    wait = True
-                else:
-                    active_compiles += 1
-        else:
-            with stats_lock:
-                active_compiles += 1
-
-        if crashed:
-            break
-
-        if wait:
-            for _ in range(1000):
-                pass
-            continue
-
-        success, msg, code = compile_once(dxc, rng.choice(pool))
-
-        with stats_lock:
-            active_compiles -= 1
-            if not success:
-                if code in CRASH_EXIT_CODES or (
-                    code and abs(code) > 1000000
-                ):
-                    crashed = True
-                    crash_info = (
-                        code,
-                        CRASH_EXIT_CODES.get(code, "Unknown"),
-                        msg,
-                    )
-                    stop.set()
-                elif code:
-                    error_count += 1
-            else:
-                compiled_count += 1
-
-
-def get_target(elapsed, total, mode):
-    if mode in ["steady", "benchmark"]:
-        return total, "STEADY MAX", True
-    t = elapsed % CYCLE_DURATION
-
-    if t < 20:
-        return total, "HEAT SOAK", True
-    if t < 35:
-        return (0 if int(t) % 2 == 0 else total), "SPIKE WAVE", True
-    if t < 50:
-        random.seed(int(t * 10))
-        choice = random.choice(
-            [
-                (0, "CHAOS 0%"),
-                (max(1, total // 2), "CHAOS 50%"),
-                (total, "CHAOS 100%"),
-            ]
-        )
-        return choice[0], choice[1], True
-
-    tgt = 1 if int(t) % 2 == 0 else 2
-    return tgt, f"BOOST ({tgt}T)", False
-
-
-def real_main(input_args=None):
-    p = argparse.ArgumentParser()
-    p.add_argument("--dxc")
-    p.add_argument("--threads", type=int, default=DEFAULT_WORKERS)
-    p.add_argument("--mode", default="steady")
-    p.add_argument("--duration", type=int, default=0)
-    p.add_argument(
-        "--worker",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    # Internal arg to pass noise count to subprocess
-    p.add_argument("--noisecount", type=int, default=MAX_NOISE_THREADS, help=argparse.SUPPRESS)
-
-    if input_args:
-        args = p.parse_args(input_args)
-    else:
-        args = p.parse_args()
-
-    if args.worker and args.noisecount:
-        pass
-
-    # --- THREAD & NOISE CALCULATION ---
-    # 1. Determine how many Noise threads we CAN run
-    # Rule: Keep at least 1 compiler thread.
-
-    actual_noise_threads = 0
-
-    if args.mode != "benchmark":
-        # If we have 1 core, noise=0. If 6+, noise=5.
-        actual_noise_threads = min(
-            MAX_NOISE_THREADS, max(0, LOGICAL_CORES - 1)
-        )
-
-    # 2. Determine Compiler Threads
-    actual_threads = args.threads
-    if actual_threads == -1:
-        if args.mode == "benchmark":
-            actual_threads = LOGICAL_CORES
-        else:
-            # User requested Cores - 3.
-            # This generally results in Cores + 2 total threads if Noise=5
-            actual_threads = max(1, LOGICAL_CORES - 3)
-
-    global target_active, pulse_barrier
-    if args.mode == "variable":
-        pulse_barrier = threading.Barrier(actual_threads)
-
-    dxc = get_dxc_path(args.dxc)
-    print(f"{Colors.HEADER}=== UE5 Stress: FINAL EDITION (Universal V9) ==={Colors.ENDC}")
-    print(
-        f"Threads: {actual_threads} (Compilers) + {actual_noise_threads} (Noise) "
-        f"| Mode: {args.mode} | Priority: BELOW_NORMAL"
-    )
-
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-    os.makedirs(TEMP_DIR)
-
-    pool = prepare_workload(max(200, actual_threads * 4))
-
-    mp_stop = multiprocessing.Event()
-    mp_q = multiprocessing.Queue()
-    mp_noise_event = multiprocessing.Event()
-    mp_noise_event.set()
-
-    noise = None
-    if actual_noise_threads > 0 and args.mode != "benchmark":
-        noise = multiprocessing.Process(
-            target=noise_entry,
-            args=(mp_stop, mp_q, TEMP_DIR, mp_noise_event, actual_noise_threads),
-        )
-        noise.daemon = True
-        noise.start()
-
-    stop = threading.Event()
-    workers = []
-    with stats_lock:
-        target_active = (
-            actual_threads if args.mode != "variable" else 0
-        )
-    for _ in range(actual_threads):
-        t = threading.Thread(
-            target=worker_loop,
-            args=(dxc, pool, args.mode, stop),
-            daemon=True,
-        )
-        workers.append(t)
-        t.start()
-
-    start = time.time()
-    rate_history = collections.deque()
-    rate_history_60 = collections.deque()
-
-    bench_start_cc = 0
-    bench_block_start = start
-    bench_scores = []
-    best_score = 0.0
-
-    last_rate_update = 0.0
-    last_60s_update = 0.0
-    display_rate = 0.0
-    display_60s = "N/A"
-
-    last_var_cc = 0
-    last_var_time = start
-
-    try:
-        while not stop.is_set():
+        while not self.stop.is_set():
             now = time.time()
-            elapsed = now - start
-            if args.duration > 0 and elapsed > args.duration:
-                stop.set()
+            elapsed = now - start_time
 
-            if not mp_q.empty():
-                c = mp_q.get()
-                global crashed, crash_info
-                crashed = True
-                crash_info = c
-                stop.set()
+            if not self.mp_queue.empty():
+                code, reason, msg = self.mp_queue.get()
+                self.print_crash(code, reason, msg)
+                return
 
-            tgt, phase, noise_state = get_target(
-                elapsed, actual_threads, args.mode
-            )
+            tgt, phase_name, noise_active = self.get_phase(elapsed)
 
-            if args.mode != "benchmark" and noise:
-                if noise_state:
-                    mp_noise_event.set()
-                else:
-                    mp_noise_event.clear()
+            if self.args.mode == "variable":
+                with self.lock: self.target_active = tgt
 
-            if args.mode == "variable":
-                with stats_lock:
-                    target_active = tgt
+            if noise_proc:
+                if noise_active: self.mp_trigger.set()
+                else: self.mp_trigger.clear()
+
+            self.update_ui(elapsed, phase_name, noise_active, bench_data)
+
+            if self.args.duration and elapsed > self.args.duration: return
+            time.sleep(0.05)
+
+    def get_phase(self, elapsed):
+        if self.args.mode != "variable": return self.comp_count, "STEADY MAX", True
+
+        t = elapsed % CYCLE_DURATION
+        if t < 20: return self.comp_count, "HEAT SOAK", True
+        if t < 35: return (0 if int(t)%2==0 else self.comp_count), "SPIKE WAVE", True
+        if t < 50:
+            random.seed(int(t*10))
+            opt = random.choice([(0,"CHAOS 0%"), (max(1,self.comp_count//2),"CHAOS 50%"), (self.comp_count,"CHAOS 100%")])
+            return opt[0], opt[1], True
+        return (1 if int(t)%2==0 else 2), "BOOST (1T)", False
+
+    def update_ui(self, elapsed, phase, noise_on, bench):
+        with self.lock:
+            a, c, e = self.stats['act'], self.stats['ok'], self.stats['err']
+
+        rate = 0.0
+        if elapsed > 1.0: rate = c / elapsed
+
+        extra = ""
+        if self.args.mode == "benchmark":
+            if time.time() - bench['start'] > 60:
+                score = (c - bench['cc']) / 60.0
+                bench['scores'].append(score)
+                bench['start'] = time.time()
+                bench['cc'] = c
+            best = max(bench['scores']) if bench['scores'] else 0
+            extra = f" | Best 60s: {best:.1f}/s"
+
+        noise_disp = self.noise_count if (noise_on and self.noise_count > 0) else 0
+        io_str = f" {Colors.FAIL}[IO:ACT]{Colors.ENDC}" if noise_disp else " [IO:OFF]"
+
+        try: cols = shutil.get_terminal_size().columns
+        except: cols = 80
+
+        status = (f"Time: {str(datetime.timedelta(seconds=int(elapsed)))} | "
+                  f"Rate: {rate:.1f}/s{extra} | "
+                  f"Act: {a + noise_disp} ({a}C+{noise_disp}N) | Err: {e} | "
+                  f"{Colors.OKGREEN if 'IDLE' in phase else Colors.WARNING}{phase}{Colors.ENDC}{io_str}")
+
+        print(f"\r{status:<{cols}}", end="", flush=True)
+
+    def compiler_worker(self, thread_id):
+        # Setup Thread-Local RNG
+        # Benchmark: Deterministic based on Thread ID (Same shaders every run)
+        # Stress: Nondeterministic (random() + Thread ID to ensure no overlap)
+        rng = random.Random()
+        if self.args.mode == "benchmark":
+            rng.seed(42 + thread_id)
+        else:
+            rng.seed(time.time() + thread_id)
+
+        flags = 0x00004000 | 0x00000008 if os.name == 'nt' else 0
+        my_shader_file = os.path.join(DXC_CONFIG["TEMP"], f"worker_{thread_id}.hlsl")
+
+        while not self.stop.is_set():
+            if self.args.mode == "variable":
+                if self.barrier and rng.random() < 0.05:
+                    try: self.barrier.wait(timeout=0.1)
+                    except: pass
+
+                wait = False
+                with self.lock:
+                    if self.stats['act'] >= self.target_active: wait = True
+                    else: self.stats['act'] += 1
+
+                if wait:
+                    for _ in range(5000): pass
+                    continue
             else:
-                phase = "STEADY MAX"
-
-            with stats_lock:
-                ac = active_compiles
-                cc = compiled_count
-                ec = error_count
-
-            calculated_rate = 0.0
-
-            if args.mode in ["steady", "benchmark"]:
-                if args.mode == "benchmark":
-                    if (now - bench_block_start) >= 60.0:
-                        block_rate = (cc - bench_start_cc) / (
-                            now - bench_block_start
-                        )
-                        bench_scores.append(block_rate)
-                        best_score = max(bench_scores)
-                        bench_block_start = now
-                        bench_start_cc = cc
-
-                if (
-                    not rate_history
-                    or (now - rate_history[-1][0]) > 0.25
-                ):
-                    rate_history.append((now, cc))
-                    while (
-                        rate_history
-                        and rate_history[0][0] < now - 30.0
-                    ):
-                        rate_history.popleft()
-                    rate_history_60.append((now, cc))
-                    while (
-                        rate_history_60
-                        and rate_history_60[0][0] < now - 60.0
-                    ):
-                        rate_history_60.popleft()
-
-                if len(rate_history) > 1:
-                    d_t = rate_history[-1][0] - rate_history[0][0]
-                    d_c = rate_history[-1][1] - rate_history[0][1]
-                    calculated_rate = d_c / d_t if d_t > 0 else 0.0
-
-                if elapsed > 60.0 and (
-                    now - last_60s_update
-                ) > 60.0:
-                    if len(rate_history_60) > 1:
-                        d60_t = (
-                            rate_history_60[-1][0]
-                            - rate_history_60[0][0]
-                        )
-                        d60_c = (
-                            rate_history_60[-1][1]
-                            - rate_history_60[0][1]
-                        )
-                        val = (
-                            d60_c / d60_t if d60_t > 0 else 0.0
-                        )
-                        display_60s = f"{val:.1f}/s"
-                    last_60s_update = now
-
-                update_interval = 2.0
-            else:
-                update_interval = 0.5
-
-            if now - last_rate_update > update_interval:
-                if args.mode == "variable":
-                    dt = now - last_var_time
-                    dc = cc - last_var_cc
-                    display_rate = dc / dt if dt > 0 else 0.0
-                    last_var_time = now
-                    last_var_cc = cc
-                else:
-                    display_rate = calculated_rate
-                last_rate_update = now
-
-            io_s = ""
-            int_s = ""
-            active_noise_count_display = 0
-
-            if args.mode != "benchmark":
-                is_active = mp_noise_event.is_set()
-                if is_active:
-                    active_noise_count_display = actual_noise_threads
-
-                io_s = (
-                    f" {Colors.FAIL}[IO: ACT]{Colors.ENDC}"
-                    if is_active
-                    else " [IO: OFF]"
-                )
-                int_s = (
-                    f" {Colors.OKBLUE}[INT: OK]{Colors.ENDC}"
-                    if is_active
-                    else " [INT: PAUSE]"
-                )
-
-            total_active_display = ac + active_noise_count_display
-
-            extra_info = ""
-            if args.mode == "steady":
-                extra_info = f" | 60s Avg: {display_60s}"
-            elif args.mode == "benchmark":
-                count_done = len(bench_scores)
-                if count_done < 3:
-                    extra_info = (
-                        f" | Best 60s: {best_score:.1f}/s "
-                        f"(Round {count_done+1}/3)"
-                    )
-                else:
-                    extra_info = (
-                        " | Best 60s: "
-                        f"{Colors.OKGREEN}{best_score:.1f}/s"
-                        f"{Colors.ENDC}"
-                    )
-
-            color = (
-                Colors.OKGREEN
-                if "IDLE" in phase
-                else (
-                    Colors.FAIL
-                    if "SPIKE" in phase
-                    else Colors.WARNING
-                )
-            )
+                with self.lock: self.stats['act'] += 1
 
             try:
-                cols = shutil.get_terminal_size().columns
-            except Exception:
-                cols = 120
+                # JUST IN TIME GENERATION: Write new random code to thread-owned file
+                code = AssetManager.generate_shader_code(rng)
+                with open(my_shader_file, "w", encoding="utf-8") as f: f.write(code)
 
-            stat = (
-                f"Time: "
-                f"{str(datetime.timedelta(seconds=int(elapsed)))} "
-                f"| Rate: {display_rate:.1f}/s"
-                f"{extra_info} | Act: {total_active_display} | Err: {ec} | "
-                f"{color}{phase}{Colors.ENDC}{io_s}{int_s}"
-            )
-            print(f"\r{stat:<{cols-1}}", end="", flush=True)
-
-            if crashed:
-                print(
-                    f"\n\n{Colors.FAIL}{'='*60}\n"
-                    f"FAILURE DETECTED\n{'='*60}{Colors.ENDC}"
+                res = subprocess.run(
+                    [self.dxc, "-T", "ps_6_6", "-O3", "-Vd", "-E", "PSMain", "-HV", "2021", "-all_resources_bound", my_shader_file, "-Fo", "NUL"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, creationflags=flags
                 )
-                if crash_info:
-                    print(
-                        f"Code: {crash_info[0]}\n"
-                        f"Reason: {crash_info[1]}\n"
-                        f"Msg: {crash_info[2]}"
-                    )
-                sys.exit(1)
 
-            time.sleep(0.05)
+                code = res.returncode
+                with self.lock:
+                    self.stats['act'] -= 1
+                    if code == 0: self.stats['ok'] += 1
+                    else:
+                        if code in CRASH_CODES or abs(code) > 1000000:
+                            self.mp_queue.put((code, CRASH_CODES.get(code, "CRASH"), "Compiler Process Died"))
+                            self.stop.set()
+                        else: self.stats['err'] += 1
+            except Exception as e:
+                with self.lock: self.stats['act'] -= 1
+
+    def print_crash(self, code, reason, msg):
+        self.crashed_state = True
+        CrashLogger.log_failure(code, reason, msg)
+        print(f"\n\n{Colors.FAIL}{'='*60}\nHARDWARE FAILURE DETECTED\n{'='*60}{Colors.ENDC}")
+        print(f"Exit Code: {code}\nAnalysis:  {reason}\nContext:   {msg}\n")
+        print(f"{Colors.WARNING}Log saved to: {os.path.abspath(LOG_FILE)}{Colors.ENDC}")
+        self.stop.set()
+
+    def cleanup(self, threads, noise_proc):
+        # Crucial fix: Ignore SIGINT during cleanup to prevent traceback spam
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        self.stop.set()
+
+        try: self.mp_stop.set()
+        except: pass
+
+        if noise_proc:
+            try:
+                if noise_proc.is_alive():
+                    noise_proc.terminate()
+                    noise_proc.join(timeout=0.5)
+                if noise_proc.is_alive():
+                    noise_proc.kill()
+            except: pass
+
+        if not self.crashed_state:
+            CrashLogger.cleanup_log()
+
+        SysUtils.set_timer_resolution()
+        if os.path.exists(DXC_CONFIG["TEMP"]): shutil.rmtree(DXC_CONFIG["TEMP"], ignore_errors=True)
+        print("\nClean exit.")
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+def main_menu():
+    SysUtils.clear_screen()
+    print(f"{Colors.HEADER}========================================================{Colors.ENDC}")
+    print(f"{Colors.HEADER}    PYBECRASHER v{VERSION} - UE5 STRESS SIMULATOR       {Colors.ENDC}")
+    print(f"{Colors.HEADER}========================================================{Colors.ENDC}")
+    print(" 1. Variable Load (Chaos)  [Recommended for Instability]")
+    print(" 2. Steady Load            [Thermal Soak]")
+    print(" 3. Benchmark              [Throughput Score]")
+    print(" 4. View README")
+    print(" 5. View LICENSE")
+    print("--------------------------------------------------------")
+
+    choice = input(" Select Mode [1]: ").strip()
+    mode = "variable"
+    if choice == "2": mode = "steady"
+    if choice == "3": mode = "benchmark"
+    if choice == "4":
+        SysUtils.print_file_content("README.md", "README")
+        return main_menu()
+    if choice == "5":
+        SysUtils.print_file_content("LICENSE", "LICENSE")
+        return main_menu()
+
+    if getattr(sys, 'frozen', False): exe = sys.executable
+    else: exe = sys.executable + " " + os.path.abspath(__file__)
+
+    cmd = f'{exe} --worker --mode {mode}'
+    try:
+        subprocess.run(cmd, shell=True)
     except KeyboardInterrupt:
         pass
-    finally:
-        stop.set()
-        mp_stop.set()
-        for t in workers:
-            t.join(1.0)
 
-        if noise and noise.is_alive():
-            noise.terminate()
-            noise.join(timeout=2.0)
-            if noise.is_alive():
-                try:
-                    noise.kill()
-                except AttributeError:
-                    pass
-
-        try:
-            ctypes.windll.winmm.timeEndPeriod(1)
-        except Exception:
-            pass
-        print("\nCleanup Done.")
-        try:
-            shutil.rmtree(TEMP_DIR)
-        except Exception:
-            pass
-
-
-# --- WATCHDOG / FRONTEND ---
-
-def run_watchdog():
-    pass_args = sys.argv[1:]
-    interactive_mode = False
-
-    if len(sys.argv) == 1:
-        interactive_mode = True
-        try:
-            while True:
-                os.system("cls" if os.name == "nt" else "clear")
-                print(
-                    f"{Colors.HEADER}========================================================"
-                )
-                print("                       PYBECRASHER                      ")
-                print(
-                    "    UE5 SHADER COMPILATION AND OODLE-LIKE STRESSOR      "
-                )
-                print(
-                    f"========================================================"
-                    f"{Colors.ENDC}"
-                )
-                print("")
-                print(
-                    "This tool simulates the Unreal Engine 5 "
-                    '"Preparing Shaders"'
-                )
-                print(
-                    "workload plus heavy asset decompression and RAM noise"
-                )
-                print("to test CPU/RAM/IMC stability.")
-                print("")
-                print("Select Mode:")
-                print("")
-                print(f"{Colors.OKBLUE}[1]{Colors.ENDC} Variable \"Chaos\" Load")
-                print("    - Cycles between Single Core, Ramp Up, Random, and")
-                print(
-                    "      Transient Spikes (Idle to Max instantly) with "
-                    "noise."
-                )
-                print("")
-                print(f"{Colors.OKBLUE}[2]{Colors.ENDC} Steady Load")
-                print("    - Constant 100% compiler load + noise.")
-                print("    - Best for thermal and long-term stability.")
-                print("")
-                print(f"{Colors.OKBLUE}[3]{Colors.ENDC} Benchmark Mode")
-                print("    - Pure Compiler Throughput (No Noise).")
-                print("    - Best for comparing CPU performance.")
-                print("")
-                print("--- Info ---")
-                print(f"{Colors.OKBLUE}[4]{Colors.ENDC} View README.md")
-                print(f"{Colors.OKBLUE}[5]{Colors.ENDC} View LICENSE")
-                print("")
-
-                choice = input("Enter selection (default is 1): ").strip()
-
-                if choice == "4":
-                    print_file_content("README.md", "README")
-                    continue
-                elif choice == "5":
-                    print_file_content("LICENSE", "LICENSE")
-                    continue
-                elif choice == "2":
-                    pass_args = ["--mode", "steady"]
-                    break
-                elif choice == "3":
-                    pass_args = ["--mode", "benchmark"]
-                    break
-                else:
-                    pass_args = ["--mode", "variable"]
-                    break
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting...")
-            return
-
-        print("")
-        print(
-            f"Starting Stress Test in {pass_args[1]} mode..."
-        )
-        print("Press Ctrl+C to stop at any time.")
-        print("")
-
-    if getattr(sys, "frozen", False):
-        cmd = [sys.executable, "--worker"] + pass_args
-    else:
-        script = os.path.abspath(sys.argv[0])
-        cmd = [sys.executable, script, "--worker"] + pass_args
-
-    aborted = False
-    proc = None
-    try:
-        creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP
-            if sys.platform == "win32"
-            else 0
-        )
-        proc = subprocess.Popen(cmd, creationflags=creationflags)
-
-        while proc.poll() is None:
-            time.sleep(0.5)
-
-        if proc.returncode not in (0, 3221225786):
-            print(
-                f"\n{Colors.FAIL}CRITICAL FAILURE: Exit Code "
-                f"{proc.returncode}{Colors.ENDC}"
-            )
-            if proc.returncode in CRASH_EXIT_CODES:
-                print(
-                    f"Reason: {CRASH_EXIT_CODES[proc.returncode]}"
-                )
-    except KeyboardInterrupt:
-        aborted = True
-        if proc is not None:
-            if sys.platform == "win32":
-                proc.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                proc.terminate()
-
-            print("\nStopping...")
-            try:
-                proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-    if interactive_mode and not aborted:
-        print("")
-        print("========================================================")
-        print("Test execution finished.")
-        print("========================================================")
-        input("Press Enter to close...")
-
+    # Swallow interrupt on final exit wait
+    print("\nTest finished.")
+    try: input("Press Enter to close...")
+    except: pass
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    if "--worker" in sys.argv:
-        real_main(sys.argv[1:])
-    else:
-        run_watchdog()
+    SysUtils.set_timer_resolution()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--mode", default="variable")
+    parser.add_argument("--duration", type=int, default=0)
+    args = parser.parse_args()
+
+    try:
+        if args.worker:
+            ctrl = StressController(args)
+            ctrl.run()
+        else:
+            main_menu()
+    except KeyboardInterrupt:
+        pass # Clean exit on Ctrl+C
