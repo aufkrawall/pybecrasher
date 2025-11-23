@@ -44,7 +44,7 @@ from ctypes import wintypes
 # CONFIGURATION & CONSTANTS
 # ==============================================================================
 
-VERSION = "7.0"
+VERSION = "13.0"
 
 DXC_CONFIG = {
     "URL": "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2407/dxc_2024_07_31.zip",
@@ -55,9 +55,8 @@ DXC_CONFIG = {
 LOG_FILE = "pybecrasher.log"
 SYSTEM_CORES = os.cpu_count() or 1
 CYCLE_DURATION = 60
-MAX_NOISE_THREADS = 5
+MAX_NOISE_THREADS = 4 # (1 RAM, 1 IO, 2 Integrity)
 
-# Windows Error Codes relevant to hardware instability
 CRASH_CODES = {
     -1073741819: "Access Violation (0xC0000005) - RAM/Vcore Unstable",
     3221225477: "Access Violation (0xC0000005) - RAM/Vcore Unstable",
@@ -85,13 +84,11 @@ class Colors:
 class SysUtils:
     @staticmethod
     def set_timer_resolution():
-        """Sets Windows timer resolution to 1ms for accurate loops."""
         try: ctypes.windll.winmm.timeBeginPeriod(1)
         except: pass
 
     @staticmethod
     def get_total_ram():
-        """Returns total physical RAM in bytes."""
         class MEMORYSTATUSEX(ctypes.Structure):
             _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
                         ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
@@ -105,7 +102,6 @@ class SysUtils:
 
     @staticmethod
     def get_resource_path(filename):
-        """Locates external files (README/LICENSE) either in bundle or local dir."""
         if os.path.exists(filename):
             return os.path.abspath(filename)
         if hasattr(sys, '_MEIPASS'):
@@ -139,7 +135,6 @@ class SysUtils:
 class CrashLogger:
     @staticmethod
     def start_log(mode, threads):
-        """Initialize log file. Overwrites previous log."""
         try:
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(f"=== PyBeCrasher v{VERSION} Session Log ===\n")
@@ -154,7 +149,6 @@ class CrashLogger:
 
     @staticmethod
     def log_failure(code, reason, context):
-        """Append crash details to log."""
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(f"\n!!! HARDWARE FAILURE DETECTED at {datetime.datetime.now()} !!!\n")
@@ -165,7 +159,6 @@ class CrashLogger:
 
     @staticmethod
     def cleanup_log():
-        """Delete log if no crash occurred."""
         if os.path.exists(LOG_FILE):
             try: os.remove(LOG_FILE)
             except: pass
@@ -177,12 +170,18 @@ class CrashLogger:
 class AssetManager:
     SHADER_RAM = """
     struct PS_INPUT {{ float4 Pos : SV_POSITION; float2 UV : TEXCOORD; }};
-    static const float4 DATA[{size}] = {{ {data} }};
+    // Procedural pseudo-random generator
+    float4 get_data(uint idx) {{
+        uint h = idx * 0xdeadbeef;
+        h = (h ^ (h >> 4)) * 0x1234567;
+        float v = float(h & 0xffff) / 65536.0;
+        return float4(v, v*0.5, 0, 1);
+    }}
     float4 PSMain(PS_INPUT i) : SV_TARGET {{
-        uint idx = (uint)(abs(i.Pos.x)*100000.0) % {size};
+        uint idx = (uint)(abs(i.Pos.x)*100000.0) % 16384;
         float4 acc = 0;
         [loop] for(int k=0; k<{steps}; k++) {{
-            acc = mad(acc, DATA[(idx + k*127) % {size}], 0.0001);
+            acc = mad(acc, get_data((idx + k*127) % 16384), 0.0001);
         }}
         return acc;
     }}"""
@@ -203,7 +202,6 @@ class AssetManager:
 
     @staticmethod
     def get_dxc_binary():
-        """Locates or downloads the DXC binary."""
         bin_path = os.path.abspath(os.path.join(DXC_CONFIG["DIR"], "bin", "dxc.exe"))
         if os.path.exists(bin_path): return bin_path
 
@@ -216,7 +214,6 @@ class AssetManager:
                     for f in z.namelist():
                         if f.startswith("bin/x64/"): z.extract(f, DXC_CONFIG["DIR"])
 
-            # Flatten folder structure
             src = os.path.join(DXC_CONFIG["DIR"], "bin", "x64")
             dst = os.path.join(DXC_CONFIG["DIR"], "bin")
             if os.path.exists(src):
@@ -234,12 +231,23 @@ class AssetManager:
 
     @staticmethod
     def generate_shader_code(rng):
-        """Just-in-time shader code generation using the provided RNG instance."""
         if rng.random() < 0.4:
-            ram_data = ",".join([f"float4({rng.random():.4f},0,0,0)" for _ in range(16384)])
-            return AssetManager.SHADER_RAM.format(size=16384, data=ram_data, steps=rng.randint(60000, 100000))
+            return AssetManager.SHADER_RAM.format(steps=rng.randint(60000, 100000))
         else:
             return AssetManager.SHADER_HYBRID.format(steps=rng.randint(600000, 1000000), unroll=1024)
+
+    @staticmethod
+    def precompute_benchmark_pool(count):
+        sys.stdout.write(f"Pre-generating {count} static benchmark shaders... ")
+        pool = []
+        rng = random.Random(42) # Deterministic Seed
+        for i in range(count):
+            fname = os.path.join(DXC_CONFIG["TEMP"], f"bench_{i}.hlsl")
+            code = AssetManager.generate_shader_code(rng)
+            with open(fname, "w", encoding="utf-8") as f: f.write(code)
+            pool.append(fname)
+        print(f"{Colors.OKGREEN}Done.{Colors.ENDC}")
+        return pool
 
 # ==============================================================================
 # NOISE SUB-SYSTEM (Running in separate process)
@@ -250,7 +258,8 @@ class NoiseModules:
         def __init__(self, stop, trigger): self.stop, self.trigger = stop, trigger
         def run(self):
             try:
-                sz = int(SysUtils.get_total_ram() * 0.70)
+                # 60% Allocation
+                sz = int(SysUtils.get_total_ram() * 0.60)
                 buf = bytearray(sz)
                 view = memoryview(buf)
                 max_idx = sz - 4096
@@ -269,8 +278,9 @@ class NoiseModules:
                         view[base] ^= 0xFF
                     else:
                         end = min(idx + 4096, sz)
-                        for i in range(idx, end, 64): view[i] += 1
-                except: break
+                        for i in range(idx, end, 64):
+                            view[i] = (view[i] + 1) % 256
+                except: pass
 
     class IntegrityStress:
         def __init__(self, stop, q, trigger): self.stop, self.q, self.trigger = stop, q, trigger
@@ -302,11 +312,18 @@ class NoiseModules:
 
     class IoStress:
         def __init__(self, stop, folder, trigger):
-            self.stop, self.f, self.trigger = stop, os.path.join(folder, "io.dat"), trigger
+            self.stop, self.folder, self.trigger = stop, folder, trigger
+            self.f = os.path.join(folder, "io.dat")
 
         def run(self):
+            try:
+                if not os.path.exists(self.folder): os.makedirs(self.folder, exist_ok=True)
+            except: pass
+
             if not os.path.exists(self.f):
-                with open(self.f, "wb") as f: f.write(os.urandom(1024*1024*1024))
+                try:
+                    with open(self.f, "wb") as f: f.write(os.urandom(1024*1024*1024))
+                except: return
 
             k32 = ctypes.windll.kernel32
             h = k32.CreateFileW(self.f, 0x80000000, 0, None, 3, 0x20000000, None)
@@ -329,12 +346,13 @@ def noise_process_entry(stop_evt, msg_queue, temp_dir, active_evt, thread_limit)
     """Entry point for the isolated noise process."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
+    local_io_dir = os.path.join(temp_dir, "io_stress")
+
     modules = [
         NoiseModules.IntegrityStress(stop_evt, msg_queue, active_evt),
         NoiseModules.RamAnvil(stop_evt, active_evt),
         NoiseModules.IntegrityStress(stop_evt, msg_queue, active_evt),
-        NoiseModules.IoStress(stop_evt, temp_dir, active_evt),
-        NoiseModules.RamAnvil(stop_evt, active_evt)
+        NoiseModules.IoStress(stop_evt, local_io_dir, active_evt)
     ]
 
     threads = []
@@ -344,6 +362,10 @@ def noise_process_entry(stop_evt, msg_queue, temp_dir, active_evt, thread_limit)
         threads.append(t)
 
     while not stop_evt.is_set(): time.sleep(1)
+
+    if os.path.exists(local_io_dir):
+        try: shutil.rmtree(local_io_dir, ignore_errors=True)
+        except: pass
 
 # ==============================================================================
 # MAIN STRESS CONTROLLER
@@ -355,12 +377,10 @@ class StressController:
         self.dxc = AssetManager.get_dxc_binary()
         self.crashed_state = False
 
-        # --- Thread Calculation (Universal v9 Logic) ---
         self.noise_count = 0 if args.mode == "benchmark" else min(MAX_NOISE_THREADS, max(0, SYSTEM_CORES - 1))
 
         self.comp_count = SYSTEM_CORES
         if args.mode != "benchmark":
-            # Cores - 3 logic -> Cores + 2 threads total
             self.comp_count = max(1, SYSTEM_CORES - 3)
 
         self.total_threads_display = f"{self.comp_count} (Compilers) + {self.noise_count} (Noise)"
@@ -375,12 +395,18 @@ class StressController:
         self.mp_queue = multiprocessing.Queue()
         self.mp_trigger = multiprocessing.Event()
         self.mp_trigger.set()
+        self.diag_printed = False
 
     def run(self):
         print(f"{Colors.HEADER}=== PyBeCrasher v{VERSION} ==={Colors.ENDC}")
         print(f"Mode: {self.args.mode} | Load: {self.total_threads_display} | Priority: BELOW_NORMAL")
 
         AssetManager.setup_workspace()
+
+        # Pre-generate files ONLY for benchmark mode to avoid disk writes during test
+        bench_pool = []
+        if self.args.mode == "benchmark":
+            bench_pool = AssetManager.precompute_benchmark_pool(max(200, self.comp_count * 4))
 
         noise_proc = None
         if self.noise_count > 0:
@@ -394,9 +420,8 @@ class StressController:
         threads = []
         self.target_active = self.comp_count if self.args.mode != "variable" else 0
 
-        # Launch workers with Thread ID to ensure unique file handles/seeds
         for i in range(self.comp_count):
-            t = threading.Thread(target=self.compiler_worker, args=(i,))
+            t = threading.Thread(target=self.compiler_worker, args=(i, bench_pool))
             t.daemon = True
             t.start()
             threads.append(t)
@@ -465,7 +490,6 @@ class StressController:
             extra = f" | Best 60s: {best:.1f}/s"
 
         noise_disp = self.noise_count if (noise_on and self.noise_count > 0) else 0
-        io_str = f" {Colors.FAIL}[IO:ACT]{Colors.ENDC}" if noise_disp else " [IO:OFF]"
 
         try: cols = shutil.get_terminal_size().columns
         except: cols = 80
@@ -473,14 +497,11 @@ class StressController:
         status = (f"Time: {str(datetime.timedelta(seconds=int(elapsed)))} | "
                   f"Rate: {rate:.1f}/s{extra} | "
                   f"Act: {a + noise_disp} ({a}C+{noise_disp}N) | Err: {e} | "
-                  f"{Colors.OKGREEN if 'IDLE' in phase else Colors.WARNING}{phase}{Colors.ENDC}{io_str}")
+                  f"{Colors.OKGREEN if 'IDLE' in phase else Colors.WARNING}{phase}{Colors.ENDC}")
 
         print(f"\r{status:<{cols}}", end="", flush=True)
 
-    def compiler_worker(self, thread_id):
-        # Setup Thread-Local RNG
-        # Benchmark: Deterministic based on Thread ID (Same shaders every run)
-        # Stress: Nondeterministic (random() + Thread ID to ensure no overlap)
+    def compiler_worker(self, thread_id, bench_pool):
         rng = random.Random()
         if self.args.mode == "benchmark":
             rng.seed(42 + thread_id)
@@ -508,12 +529,16 @@ class StressController:
                 with self.lock: self.stats['act'] += 1
 
             try:
-                # JUST IN TIME GENERATION: Write new random code to thread-owned file
-                code = AssetManager.generate_shader_code(rng)
-                with open(my_shader_file, "w", encoding="utf-8") as f: f.write(code)
+                target_file = ""
+                if self.args.mode == "benchmark":
+                    target_file = rng.choice(bench_pool)
+                else:
+                    target_file = my_shader_file
+                    code = AssetManager.generate_shader_code(rng)
+                    with open(target_file, "w", encoding="utf-8") as f: f.write(code)
 
                 res = subprocess.run(
-                    [self.dxc, "-T", "ps_6_6", "-O3", "-Vd", "-E", "PSMain", "-HV", "2021", "-all_resources_bound", my_shader_file, "-Fo", "NUL"],
+                    [self.dxc, "-T", "ps_6_6", "-O3", "-Vd", "-E", "PSMain", "-HV", "2021", "-all_resources_bound", target_file, "-Fo", "NUL"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, creationflags=flags
                 )
 
@@ -525,7 +550,11 @@ class StressController:
                         if code in CRASH_CODES or abs(code) > 1000000:
                             self.mp_queue.put((code, CRASH_CODES.get(code, "CRASH"), "Compiler Process Died"))
                             self.stop.set()
-                        else: self.stats['err'] += 1
+                        else:
+                            self.stats['err'] += 1
+                            if not self.diag_printed:
+                                print(f"\n{Colors.WARNING}[DIAGNOSTIC] DXC Failed: {res.stderr}{Colors.ENDC}")
+                                self.diag_printed = True
             except Exception as e:
                 with self.lock: self.stats['act'] -= 1
 
@@ -538,7 +567,6 @@ class StressController:
         self.stop.set()
 
     def cleanup(self, threads, noise_proc):
-        # Crucial fix: Ignore SIGINT during cleanup to prevent traceback spam
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
         self.stop.set()
@@ -598,7 +626,6 @@ def main_menu():
     except KeyboardInterrupt:
         pass
 
-    # Swallow interrupt on final exit wait
     print("\nTest finished.")
     try: input("Press Enter to close...")
     except: pass
